@@ -1,0 +1,19 @@
+/__pycache__/
+*.pyc
+.DS_Store
+/TMS20/*
+/TMS20_censored/*
+TMS20/*.mkv
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.mp3
+*.csv
+*.json
+
+### macOS ###
+# General
+.DS_Store
+.AppleDouble
+.LSOverride
