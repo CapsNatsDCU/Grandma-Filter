@@ -2,337 +2,265 @@
 
 Grandma Filter transcription helpers.
 
-Design goals (aligned with your roadmap):
-- Primary/default: faster-whisper (but guarded so it can’t wedge the whole process)
-- Backup: whisperx (CLI) for word-level timestamps/alignment
-- No heavy imports at module import time (torch/whisper/transformers can hang)
-- App-ready: return structured dicts, write JSON deterministically, machine-readable logs
-- Strict: caller can decide whether a failure is fatal
+Locked decisions (current):
+- Primary/default transcription backend: faster-whisper
+- Prefer word-level timestamps from faster-whisper (no WhisperX)
 
-IMPORTANT NOTE (current reality):
-On your Python 3.13 environment, importing faster-whisper may hang because it pulls in
-ctranslate2 -> transformers (heavy import-structure scan). We therefore:
-- try faster-whisper in a subprocess with a timeout
-- if it times out, we fall back to whisperx CLI
+This module is designed to be library-friendly:
+- No CLI parsing here
+- Model is cached in-process so batch runs are fast
 
-Later, once you move to a Python 3.12 venv or pin versions, you can switch the
-faster-whisper path to an in-process import for speed.
+Output JSON schema (Whisper-like, extended):
+{
+  "engine": "faster-whisper",
+  "model": "base",
+  "language": "en" | null,
+  "text": "...",
+  "segments": [
+    {
+      "id": 0,
+      "start": 0.0,
+      "end": 1.2,
+      "text": "...",
+      "words": [
+        {"start": 0.1, "end": 0.4, "word": "hello", "probability": 0.98},
+        ...
+      ]
+    },
+    ...
+  ]
+}
+
+If word timestamps are not available, `words` will be an empty list.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 import json
-import os
-import subprocess
 import time
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 
-# -------------------------
-# Utilities
-# -------------------------
-
-def _run(cmd: list[str], *, timeout_s: Optional[int] = None) -> Tuple[int, str]:
-    """Run a command and return (returncode, combined_output)."""
-    try:
-        p = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
-        return p.returncode, (p.stdout or "").strip()
-    except subprocess.TimeoutExpired:
-        return 124, f"TIMEOUT after {timeout_s}s: {' '.join(cmd)}"
-    except Exception as e:
-        return 3, f"{type(e).__name__}: {e}"
+@dataclass(frozen=True)
+class TranscribeConfig:
+    model_name: str = "base"
+    language: Optional[str] = None
+    task: str = "transcribe"  # or "translate"
+    beam_size: int = 5
+    vad_filter: bool = True
+    word_timestamps: bool = True
+    # Note: on macOS/Apple Silicon, faster-whisper via CTranslate2 typically runs on CPU.
+    device: str = "cpu"
+    compute_type: str = "int8"  # good default on CPU
 
 
-def _write_json(path: str | Path, obj: Any) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
+# -------- Model cache --------
+
+_MODEL_CACHE: Dict[Tuple[str, str, str], Any] = {}
 
 
-def _read_json(path: str | Path) -> Any:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def _get_model(cfg: TranscribeConfig):
+    """Get (and cache) a WhisperModel instance for this config."""
+    key = (cfg.model_name, cfg.device, cfg.compute_type)
+    model = _MODEL_CACHE.get(key)
+    if model is not None:
+        return model
+
+    from faster_whisper import WhisperModel  # local import to keep module import light
+
+    model = WhisperModel(cfg.model_name, device=cfg.device, compute_type=cfg.compute_type)
+    _MODEL_CACHE[key] = model
+    return model
 
 
-def _default_output_json(audio_file: str | Path, output_dir: str | Path) -> str:
-    audio_file = Path(audio_file)
-    output_dir = Path(output_dir)
-    return str(output_dir / f"{audio_file.stem}.json")
+# -------- Public API --------
 
 
-# -------------------------
-# Primary: faster-whisper (guarded)
-# -------------------------
-
-def transcribe_faster_whisper_guarded(
+def transcribe_to_dict(
     audio_file: str,
     *,
-    model_name: str = "base",
-    language: Optional[str] = None,
-    output_json_path: Optional[str] = None,
-    timeout_s: int = 60,
+    cfg: Optional[TranscribeConfig] = None,
 ) -> Dict[str, Any]:
-    """Attempt transcription via faster-whisper in a subprocess.
+    """Transcribe `audio_file` and return a structured dict (see module docstring)."""
+    cfg = cfg or TranscribeConfig()
+    model = _get_model(cfg)
 
-    Returns a dict:
-      {
-        "ok": bool,
-        "engine": "faster-whisper",
-        "timed_out": bool,
-        "output_json": str|None,
-        "error": str|None
-      }
-
-    We run it in a subprocess to avoid wedging the main process if imports hang.
-    """
-
-    out_json = output_json_path
-    if out_json is None:
-        out_json = _default_output_json(audio_file, ".")
-
-    # Script executed in the child process. It writes a Whisper-like JSON with segments.
-    # We keep it simple: segments with start/end/text plus a top-level language (if provided).
-    lang_literal = "None" if language is None else repr(language)
-
-    child_code = f"""
-import json
-from pathlib import Path
-
-AUDIO = {audio_file!r}
-MODEL = {model_name!r}
-LANG = {lang_literal}
-OUT = {out_json!r}
-
-# Import inside child (can hang — parent has timeout)
-from faster_whisper import WhisperModel
-
-# Choose device. On Apple Silicon with torch+mps, faster-whisper still uses ctranslate2.
-# 'cpu' is safest. You can switch to 'metal' once you verify your stack supports it.
-model = WhisperModel(MODEL, device='cpu', compute_type='int8')
-
-segments, info = model.transcribe(AUDIO, language=LANG)
-
-out = {{
-  'text': '',
-  'language': getattr(info, 'language', LANG) if info is not None else LANG,
-  'segments': []
-}}
-
-texts = []
-for seg in segments:
-    s = {{
-      'start': float(getattr(seg, 'start', 0.0)),
-      'end': float(getattr(seg, 'end', 0.0)),
-      'text': str(getattr(seg, 'text', '')).strip(),
-    }}
-    out['segments'].append(s)
-    if s['text']:
-        texts.append(s['text'])
-
-out['text'] = ' '.join(texts).strip()
-
-Path(OUT).parent.mkdir(parents=True, exist_ok=True)
-with open(OUT, 'w', encoding='utf-8') as f:
-    json.dump(out, f, indent=2, ensure_ascii=False)
-"""
-
-    rc, out = _run(["python", "-c", child_code], timeout_s=timeout_s)
-
-    if rc == 0 and Path(out_json).exists():
-        return {
-            "ok": True,
-            "engine": "faster-whisper",
-            "timed_out": False,
-            "output_json": out_json,
-            "error": None,
-        }
-
-    if rc == 124:
-        return {
-            "ok": False,
-            "engine": "faster-whisper",
-            "timed_out": True,
-            "output_json": None,
-            "error": out,
-        }
-
-    return {
-        "ok": False,
-        "engine": "faster-whisper",
-        "timed_out": False,
-        "output_json": None,
-        "error": out,
-    }
-
-
-# -------------------------
-# Backup: whisperx (CLI)
-# -------------------------
-
-def transcribe_whisperx_cli(
-    audio_file: str,
-    *,
-    model_name: str = "base",
-    language: Optional[str] = None,
-    output_dir: str = "./mini_audio",
-    compute_type: str = "int8",
-) -> Dict[str, Any]:
-    """Run whisperx via CLI and return a structured result.
-
-    whisperx will generate a JSON file in output_dir.
-    """
-
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        "whisperx",
+    segments_iter, info = model.transcribe(
         audio_file,
-        "--model",
-        model_name,
-        "--device",
-        "cpu",
-        "--compute_type",
-        compute_type,
-        "--output_format",
-        "json",
-        "--output_dir",
-        output_dir,
-    ]
-    if language:
-        cmd.extend(["--language", language])
+        language=cfg.language,
+        task=cfg.task,
+        beam_size=cfg.beam_size,
+        vad_filter=cfg.vad_filter,
+        word_timestamps=cfg.word_timestamps,
+        condition_on_previous_text=False,
+    )
 
-    rc, out = _run(cmd)
-
-    out_json = _default_output_json(audio_file, output_dir)
-
-    if rc == 0 and Path(out_json).exists():
-        return {
-            "ok": True,
-            "engine": "whisperx",
-            "output_json": out_json,
-            "error": None,
-        }
-
-    return {
-        "ok": False,
-        "engine": "whisperx",
-        "output_json": None,
-        "error": out,
+    out: Dict[str, Any] = {
+        "engine": "faster-whisper",
+        "model": cfg.model_name,
+        "language": getattr(info, "language", None) if info is not None else cfg.language,
+        "text": "",
+        "segments": [],
     }
 
+    full_text_parts: List[str] = []
 
-# -------------------------
-# Public entry points
-# -------------------------
+    # Strict gatekeeper: drop obvious hallucinations / silence segments
+    # (keeps downstream transcript/censoring sane)
+    last_text: str = ""
+    repeat_count: int = 0
+
+    for idx, seg in enumerate(segments_iter):
+        seg_text = str(getattr(seg, "text", "")).strip()
+        s = {
+            "id": idx,
+            "start": float(getattr(seg, "start", 0.0)),
+            "end": float(getattr(seg, "end", 0.0)),
+            "text": seg_text,
+            "words": [],
+        }
+
+        # Optional diagnostic fields (present on many faster-whisper Segment objects)
+        for k in ("no_speech_prob", "avg_logprob", "compression_ratio", "temperature"):
+            v = getattr(seg, k, None)
+            if v is not None:
+                try:
+                    s[k] = float(v)
+                except Exception:
+                    pass
+
+        # Gatekeeper filter (conservative): skip segments likely to be silence/hallucination
+        no_speech = float(s.get("no_speech_prob", 0.0) or 0.0)
+        avg_logprob = float(s.get("avg_logprob", 0.0) or 0.0)
+        compression = float(s.get("compression_ratio", 0.0) or 0.0)
+
+        txt_l = seg_text.lower().strip()
+        short_text = (0 < len(txt_l) <= 6)
+
+        # 1) High no-speech probability + very short or very low confidence text
+        if no_speech >= 0.60 and (short_text or avg_logprob < -1.0):
+            continue
+
+        # 2) High compression ratio often indicates repetitive / degenerate decoding
+        if compression >= 3.0 and short_text:
+            continue
+
+        # 3) Repetition guard: drop repeated identical short segments after a couple repeats
+        if seg_text == last_text and short_text:
+            repeat_count += 1
+            if repeat_count >= 3:
+                continue
+        else:
+            last_text = seg_text
+            repeat_count = 0
+
+        # faster-whisper returns seg.words when word_timestamps=True
+        words = getattr(seg, "words", None)
+        if words:
+            for w in words:
+                try:
+                    s["words"].append(
+                        {
+                            "start": float(getattr(w, "start", 0.0)),
+                            "end": float(getattr(w, "end", 0.0)),
+                            "word": str(getattr(w, "word", "")).strip(),
+                            "probability": float(getattr(w, "probability", 0.0)),
+                        }
+                    )
+                except Exception:
+                    # Keep going; word timing is a best-effort enhancement
+                    continue
+
+        out["segments"].append(s)
+        if seg_text:
+            full_text_parts.append(seg_text)
+
+    out["text"] = " ".join(full_text_parts).strip()
+
+    # Normalize language to a simple string when present
+    lang = out.get("language")
+    if isinstance(lang, str):
+        out["language"] = lang.strip() or None
+
+    return out
+
+
+def transcribe_to_json_file(
+    audio_file: str,
+    *,
+    output_json_path: str = "output.json",
+    cfg: Optional[TranscribeConfig] = None,
+) -> str:
+    """Transcribe `audio_file` and write the JSON to `output_json_path`. Returns the path."""
+    data = transcribe_to_dict(audio_file, cfg=cfg)
+    out_path = Path(output_json_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    return str(out_path)
+
+
+# Backwards-compatible wrapper used by your existing main.py
+
+def run_whisper_live(
+    audio_file: str = "output.mp3",
+    output_json: str = "output.json",
+    *,
+    model_name: str = "base",
+    language: Optional[str] = None,
+    timeout_s: int = 0,
+) -> None:
+    """Legacy entry point.
+
+    - `timeout_s` is ignored in the direct-import implementation.
+    - Writes `output_json` in the expected format.
+    """
+    _ = timeout_s
+    cfg = TranscribeConfig(model_name=model_name, language=language)
+    transcribe_to_json_file(audio_file, output_json_path=output_json, cfg=cfg)
+
+
+def load_detected_language(transcript_json_path: str) -> Optional[str]:
+    try:
+        with open(transcript_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        lang = data.get("language")
+        return lang.strip() if isinstance(lang, str) and lang.strip() else None
+    except Exception:
+        return None
+
+
+# Convenience function retained for callers that used `transcribe_audio()`
 
 def transcribe_audio(
     audio_file: str,
     *,
     model_name: str = "base",
     language: Optional[str] = None,
-    primary_timeout_s: int = 60,
-    primary_output_json: Optional[str] = None,
-    whisperx_output_dir: str = "./mini_audio",
+    output_json_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Transcribe audio.
-
-    Strategy:
-    1) Try faster-whisper (guarded subprocess)
-    2) If timeout/failure, fall back to whisperx CLI
-
-    Returns:
-      {
-        "ok": bool,
-        "engine": "faster-whisper"|"whisperx",
-        "output_json": str|None,
-        "timed_out": bool,
-        "error": str|None,
-        "elapsed_s": float
-      }
-    """
-
     start = time.time()
-
-    # 1) Primary
-    primary = transcribe_faster_whisper_guarded(
-        audio_file,
-        model_name=model_name,
-        language=language,
-        output_json_path=primary_output_json,
-        timeout_s=primary_timeout_s,
-    )
-    if primary["ok"]:
-        primary["elapsed_s"] = round(time.time() - start, 3)
-        primary["output_json"] = primary.get("output_json")
-        return {
-            "ok": True,
-            "engine": "faster-whisper",
-            "output_json": primary.get("output_json"),
-            "timed_out": False,
-            "error": None,
-            "elapsed_s": primary["elapsed_s"],
-        }
-
-    # 2) Backup
-    backup = transcribe_whisperx_cli(
-        audio_file,
-        model_name=model_name,
-        language=language,
-        output_dir=whisperx_output_dir,
-    )
-
-    elapsed = round(time.time() - start, 3)
-
-    if backup["ok"]:
-        return {
-            "ok": True,
-            "engine": "whisperx",
-            "output_json": backup.get("output_json"),
-            "timed_out": bool(primary.get("timed_out")),
-            "error": None,
-            "elapsed_s": elapsed,
-        }
-
-    return {
-        "ok": False,
-        "engine": "whisperx" if backup else "faster-whisper",
-        "output_json": None,
-        "timed_out": bool(primary.get("timed_out")),
-        "error": f"Primary failed: {primary.get('error')} | Backup failed: {backup.get('error')}",
-        "elapsed_s": elapsed,
-    }
-
-
-def load_detected_language(transcript_json_path: str) -> Optional[str]:
-    """Best-effort: extract detected language from a transcript JSON."""
-    try:
-        data = _read_json(transcript_json_path)
-        lang = data.get("language")
-        if isinstance(lang, str) and lang.strip():
-            return lang.strip()
-        # whisperx sometimes nests language differently; keep it simple for now.
-        return None
-    except Exception:
-        return None
+    cfg = TranscribeConfig(model_name=model_name, language=language)
+    if output_json_path:
+        transcribe_to_json_file(audio_file, output_json_path=output_json_path, cfg=cfg)
+        res = {"ok": True, "engine": "faster-whisper", "output_json": output_json_path, "error": None}
+    else:
+        _ = transcribe_to_dict(audio_file, cfg=cfg)
+        res = {"ok": True, "engine": "faster-whisper", "output_json": None, "error": None}
+    res["elapsed_s"] = round(time.time() - start, 3)
+    return res
 
 
 if __name__ == "__main__":
-    # Minimal smoke test (won't run unless you call it directly)
-    # Example:
-    #   python whisperCalls.py ./mini_audio/0.mp3
     import sys
 
-    if len(sys.argv) >= 2:
-        audio = sys.argv[1]
-        res = transcribe_audio(audio, model_name="base", language=None)
-        print(json.dumps(res, indent=2))
-    else:
-        print("Usage: python whisperCalls.py <audio_file>")
+    if len(sys.argv) < 2:
+        print("Usage: python whisperCalls.py <audio_file> [output.json]")
+        raise SystemExit(2)
+
+    audio = sys.argv[1]
+    out = sys.argv[2] if len(sys.argv) >= 3 else "output.json"
+    transcribe_to_json_file(audio, output_json_path=out)
+    print(out)

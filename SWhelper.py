@@ -5,8 +5,9 @@ Grandma Filter helper script (STRICT GATEKEEPER).
 
 Locked decisions:
 1) faster-whisper is the primary/default transcription backend.
-   whisperx is required as the backup / alignment path.
-2) Strict gatekeeper: missing requirements => non-zero exit.
+   Word-level timing is preferred via faster-whisper (when available).
+   Additional word-timing backends may be added later, but are OPTIONAL.
+2) Strict gatekeeper: missing *required* items => non-zero exit.
 3) Must be run from repo root (main.py, processText.py, whisperCalls.py, FFMcalls.py).
 
 Usage:
@@ -111,10 +112,12 @@ def _python_identity() -> Dict[str, Any]:
 
 def _pip_identity() -> Dict[str, Any]:
     pip_path = shutil.which("pip")
-    rc, out = _run([sys.executable, "-m", "pip", "--version"])
+    # Never let pip identity wedge the gatekeeper.
+    rc, out = _run([sys.executable, "-m", "pip", "--version"], timeout_s=8)
     return {
         "pip_on_path": pip_path,
         "pip_module": out if rc == 0 else None,
+        "pip_error": out if rc != 0 else None,
     }
 
 
@@ -141,13 +144,13 @@ REPO_ROOT_REQUIRED_FILES = [
 # Required Python modules (STRICT)
 REQUIRED_MODULES = [
     "torch",
-    "faster_whisper",  # primary backend
-    "whisperx",        # backup/alignment path
+    "faster_whisper",
 ]
 
-# Optional/legacy
 OPTIONAL_MODULES = [
-    "whisper",
+    "whisper",  # legacy
+    "whisper_timestamped",  # optional word-level timestamps backend
+    "stable_ts",  # optional word-level timestamps backend
 ]
 
 

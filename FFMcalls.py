@@ -12,11 +12,12 @@ Exports:
 - make_mini_audio(...)
 - censor_audio(...)
 - replace_audio_track(...)
+- get_audio_duration_seconds(...)
+- clamp_ranges_to_duration(...)
 """
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -54,6 +55,48 @@ def extract_audio(input_media: str, output_mp3: str = "output.mp3") -> str:
     return str(out_path)
 
 
+def get_audio_duration_seconds(path: str) -> float:
+    """Return duration in seconds using ffprobe (0.0 on failure)."""
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nk=1:nw=1",
+            path,
+        ]
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if p.returncode == 0:
+            return max(0.0, float((p.stdout or "").strip() or 0.0))
+    except Exception:
+        pass
+    return 0.0
+
+
+def clamp_ranges_to_duration(
+    ranges: list[tuple[float, float]], duration_s: float
+) -> list[tuple[float, float]]:
+    """Clamp (start,end) ranges to [0,duration] and drop empty ranges."""
+    if duration_s <= 0.0:
+        return ranges
+    out: list[tuple[float, float]] = []
+    for s, e in ranges:
+        s2 = max(0.0, min(float(s), duration_s))
+        e2 = max(s2, min(float(e), duration_s))
+        if e2 > s2:
+            out.append((s2, e2))
+    return out
+
+
 def make_mini_audio(
     input_media: str,
     start: float,
@@ -63,8 +106,7 @@ def make_mini_audio(
 ) -> str:
     """Create a small audio clip from `input_media`.
 
-    This exists because `processText.prepare_mini_audio_and_word_jsons()` expects
-    `FFMcalls.make_mini_audio` to exist.
+    This exists because some legacy paths expect `FFMcalls.make_mini_audio`.
 
     You can specify either:
       - `end` (absolute seconds), or
@@ -106,7 +148,7 @@ def make_mini_audio(
     return str(out_path)
 
 
-# Backwards-compatible aliases (in case other code uses different names)
+# Backwards-compatible alias
 makeMiniAudio = make_mini_audio
 
 
@@ -153,19 +195,7 @@ def censor_audio(
     beep_volume: float = 0.25,
     pad: float = 0.0,
 ) -> str:
-    """Create a censored audio file.
-
-    Parameters
-    - ranges: list of (start,end) seconds to censor
-    - input_file: source audio (e.g., output.mp3)
-    - output_file: output audio path (e.g., output_censored.mp3)
-    - mode: 'mute' or 'beep'
-    - beep_freq: sine beep frequency (Hz) when mode='beep'
-    - beep_volume: beep loudness multiplier (roughly 0.0–1.0)
-    - pad: seconds to expand each range on both sides
-
-    Returns output_file.
-    """
+    """Create a censored audio file."""
 
     out_path = Path(output_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -200,7 +230,7 @@ def censor_audio(
     # mode == 'beep'
     duration = _ffprobe_duration_seconds(input_file)
     if duration <= 0:
-        duration = 3600.0  # 1 hour fallback
+        duration = 3600.0
 
     mute_af = _build_mute_filter(ranges, pad=pad)
 
@@ -244,19 +274,12 @@ def replace_audio_track(
     video_file: str,
     censored_audio: str,
     original_audio: str | None = None,
-    output_video_file: str,
+    output_video_file: str = "output_censored.mp4",
     original_language_name: str | None = None,
     original_language_code: str | None = None,
     subtitle_file: str | None = None,
 ) -> str:
-    """Mux censored audio back into the video.
-
-    - Track 0: censored audio (default)
-    - Track 1: original audio (optional, secondary)
-    - Optional subtitle track
-
-    Returns output_video_file.
-    """
+    """Mux censored audio back into the video."""
 
     out_path = Path(output_video_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -276,34 +299,19 @@ def replace_audio_track(
     if subtitle_file:
         cmd += ["-i", subtitle_file]
 
-    # Map: video stream
     cmd += ["-map", "0:v:0"]
-
-    # Map censored audio
     cmd += ["-map", "1:a:0"]
 
-    # Map original audio if present
     if original_audio:
         cmd += ["-map", "2:a:0"]
 
-    # Map subtitles if present
     if subtitle_file:
         sub_index = 3 if original_audio else 2
         cmd += ["-map", f"{sub_index}:s:0"]
 
-    # Copy video, re-encode audio to AAC for compatibility
-    cmd += [
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-    ]
+    cmd += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]
 
-    # Metadata / disposition
     cmd += ["-disposition:a:0", "default"]
-
     if original_audio:
         cmd += ["-disposition:a:1", "0"]
 

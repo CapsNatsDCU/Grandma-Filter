@@ -156,16 +156,22 @@ def main(filepath: str, censor_mode: str) -> None:
     _cleanup_temp_outputs()
 
     checkFile(filepath)
+    # Strict gatekeeper: input must exist and be a real file (fail fast before ffmpeg)
+    if not os.path.exists(filepath):
+        print(f"❌ Input file not found: {filepath}")
+        print("Tip: include the full filename with extension (e.g., .mkv/.mp4) and use quotes if needed.")
+        raise SystemExit(2)
+    if not os.path.isfile(filepath):
+        print(f"❌ Input path is not a file: {filepath}")
+        raise SystemExit(2)
 
-    # Keep filenames consistent with your existing workflow
-    processText.filepath = filepath  # still used for mini-audio extraction offsets
     target_words = processText.load_target_words("target_words.txt")
 
     _extract_audio(filepath, "output.mp3")
     checkFile("output.mp3")
 
     # Produces output.json (segments)
-    whisperCalls.run_whisper_live()
+    whisperCalls.run_whisper_live("output.mp3", "output.json")
     checkFile("output.json")
 
     segments = processText.load_segments("output.json")
@@ -173,76 +179,80 @@ def main(filepath: str, censor_mode: str) -> None:
     # 1) Identify which segments contain target words
     processText.mark_segments_with_targets(segments, target_words)
 
-    # 2) For those segments, extract mini clips and run word-level transcription
-    processText.prepare_mini_audio_and_word_jsons(
-        filepath=filepath,
-        segments=segments,
-        target_words=target_words,
-        mini_audio_dir="mini_audio"
-    )
-
-    # 3) Compute absolute time ranges to censor (in seconds)
+    # 2) Compute absolute time ranges to censor (in seconds)
     raw_ranges = processText.build_censor_ranges(
         segments=segments,
         target_words=target_words,
-        mini_audio_dir="mini_audio",
         pad=0.02
     )
 
     ranges = _normalize_censor_ranges(raw_ranges)
-
-    # Keep report() consistent with what we actually censor after normalization
-    processText.words_removed = len(ranges)
+    duration_s = FFMcalls.get_audio_duration_seconds("output.mp3")
+    ranges = FFMcalls.clamp_ranges_to_duration(ranges, duration_s)
 
     # Helpful debug when nothing gets censored despite target segments being flagged
-    if len(ranges) == 0 and len(raw_ranges) == 0 and getattr(processText, "words_found", 0) > 0:
+    if len(ranges) == 0 and len(raw_ranges) == 0:
         flagged = sum(1 for s in segments if getattr(s, "contains_target_word", False))
-        mini_mp3 = 0
-        mini_json = 0
-        if os.path.isdir("mini_audio"):
-            mini_mp3 = sum(1 for n in os.listdir("mini_audio") if n.endswith(".mp3"))
-            mini_json = sum(1 for n in os.listdir("mini_audio") if n.endswith(".json"))
-        print(f"⚠ Debug: {flagged} segment(s) flagged, but 0 censor ranges built. mini_audio has {mini_mp3} mp3 and {mini_json} json.")
-        if mini_json == 0:
-            print("   -> This usually means WhisperX did not produce word-level JSONs. Check WhisperX install / CLI availability and errors above.")
+        if flagged > 0:
+            print(f"⚠ Debug: {flagged} segment(s) flagged, but 0 censor ranges built. Check transcription output + target word matching.")
 
-    print(f"Censor ranges: {len(raw_ranges)} → {len(ranges)} after normalization")
+    if duration_s > 0.0:
+        print(f"Censor ranges: {len(raw_ranges)} → {len(ranges)} after normalization + clamp (duration={duration_s:.2f}s)")
+    else:
+        print(f"Censor ranges: {len(raw_ranges)} → {len(ranges)} after normalization")
 
+        
     import csv
 
-    def _log_muted_words(file: str, segments: list, censor_ranges: list[tuple[float, float]]) -> None:
+    def _log_muted_words(file: str, segments: list) -> tuple[str, int, str]:
         """Append muted-word hits to muted_words.csv.
 
-        We *do not* rely on `Segment.words` (it doesn't exist in the current dataclass).
-        Instead we re-read the per-segment WhisperX word JSONs via `processText.extract_target_word_times`.
+        Preferred: word-level hits via segments[].words (from faster-whisper output.json).
+        Fallback: if no word hits, we log flagged segments as coarse hits.
+
+        Returns (csv_path, hit_count, granularity).
         """
         csv_file = "muted_words.csv"
         file_exists = os.path.isfile(csv_file)
 
-        # Pull word hits (relative to each mini clip) and convert to absolute (relative to full audio)
         hits = processText.extract_target_word_times(
             segments=segments,
             target_words=target_words,
-            mini_audio_dir="mini_audio",
+            mini_audio_dir="mini_audio",  # ignored; kept for compatibility
         )
+
+        # Determine granularity for reporting
+        granularity = "word" if len(hits) > 0 else "segment"
 
         with open(csv_file, mode="a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(["file", "word", "start", "end"])
+                writer.writerow(["file", "hit_type", "text", "start", "end", "granularity"])
 
-            for hit in hits:
-                try:
-                    offset = float(segments[hit.segment_number].start)
-                except Exception:
-                    offset = 0.0
+            if hits:
+                for hit in hits:
+                    abs_start = max(0.0, float(hit.start))
+                    abs_end = max(abs_start, float(hit.end))
+                    writer.writerow([file, "word", hit.word, f"{abs_start:.3f}", f"{abs_end:.3f}", granularity])
+            else:
+                # Fallback: log the full segments that were flagged
+                for seg in segments:
+                    if getattr(seg, "contains_target_word", False):
+                        text = str(getattr(seg, "text", "")).strip()
+                        s = float(getattr(seg, "start", 0.0))
+                        e = float(getattr(seg, "end", 0.0))
+                        writer.writerow([file, "segment", text, f"{s:.3f}", f"{e:.3f}", granularity])
 
-                abs_start = max(0.0, float(hit.start) + offset)
-                abs_end = max(abs_start, float(hit.end) + offset)
-                writer.writerow([file, hit.word, f"{abs_start:.3f}", f"{abs_end:.3f}"])
+        return csv_file, (len(hits) if hits else sum(1 for seg in segments if getattr(seg, "contains_target_word", False))), granularity
 
-    _log_muted_words(filepath, segments, ranges)
-    print("Logged muted words -> muted_words.csv")
+    # Keep report() consistent with what we actually censor after normalization
+    # Prefer the count of word-level hits when available; otherwise count flagged segments.
+    processText.words_removed = 0  # will be set after logging
+
+    csv_path, hit_count, granularity = _log_muted_words(filepath, segments)
+    print(f"Logged muted hits ({granularity}, {hit_count}) -> {csv_path}")
+
+    processText.words_removed = hit_count
 
     # 4) Build censored audio (mute by default, beep with -b)
     if not ranges:
@@ -273,6 +283,45 @@ def main(filepath: str, censor_mode: str) -> None:
         original_audio="output.mp3",
         output_video_file=output_video,
     )
+
+    # DEBUG: print full transcript again right before report
+    print("\n===== TRANSCRIPT BEFORE REPORT (DEBUG) =====")
+    for seg in segments:
+        txt = str(getattr(seg, "text", "")).strip()
+        if txt:
+            print(txt)
+    print("===== END TRANSCRIPT =====\n")
+
+    # 6) Write per-file JSON report (app-ready interface)
+    try:
+        detected_language = whisperCalls.load_detected_language("output.json")
+    except Exception:
+        detected_language = None
+
+    report = {
+        "input_file": filepath,
+        "output_file": output_video,
+        "engine": "faster-whisper",
+        "detected_language": detected_language,
+        "censor_mode": censor_mode,
+        "censor_granularity": granularity,
+        "muted_hit_count": hit_count,
+        "censor_ranges": [[float(s), float(e)] for (s, e) in ranges],
+        "processing_time_s": round(time.time() - start_time, 3),
+    }
+
+    # Write report into reports/ directory (app-friendly)
+    os.makedirs("reports", exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    report_base = os.path.basename(os.path.splitext(output_video)[0])
+    report_name = f"{report_base}.{stamp}.report.json"
+    report_path = os.path.join("reports", report_name)
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        import json
+        json.dump(report, f, indent=2, ensure_ascii=False)
+
+    print(f"Wrote report -> {report_path}")
 
     elapsed_time = time.time() - start_time
     processText.report(segments, elapsed_time)
@@ -337,7 +386,25 @@ if __name__ == "__main__":
         print("❌ --in-place cannot be combined with --output or --out-dir")
         raise SystemExit(2)
 
-    SWhelper.checkSoftware()
+    # Strict gatekeeper (updated SWhelper)
+    report = SWhelper.run_checks(install=False)
+    if not report.required_ok:
+        print("❌ Gatekeeper failed. Run: python SWhelper.py check --json")
+        for it in report.items:
+            # Only print failing required items (keeps output readable)
+            if not it.ok and it.name in {
+                "env:venv",
+                "repo:root_contract",
+                "ffmpeg",
+                "torch:accel",
+                "import:FFMcalls",
+                "import:FFMcalls.make_mini_audio",
+                *{f"python:{m}" for m in getattr(SWhelper, "REQUIRED_MODULES", [])},
+            }:
+                print(f"❌ {it.name}: {it.details}")
+                if it.recommendation:
+                    print(f"   -> {it.recommendation}")
+        raise SystemExit(2)
 
     censor_mode = "beep" if args.beep else "mute"
     print(f"Censor mode: {censor_mode}")
@@ -385,6 +452,7 @@ if __name__ == "__main__":
                     else:
                         print(f"    ⚠ Expected output missing: {default_out}")
 
+
                 if args.in_place:
                     # Atomically replace original with censored output
                     if os.path.exists(out_video):
@@ -411,6 +479,15 @@ if __name__ == "__main__":
 
         print("INPUT:", args.filepath)
         print("OUTPUT:", out_video) #AHHHH
+
+        # Strict gatekeeper: input must exist before we call ffmpeg
+        if not os.path.exists(args.filepath):
+            print(f"❌ Input file not found: {args.filepath}")
+            print("Tip: include the full filename with extension (e.g., .mkv/.mp4) and use quotes if needed.")
+            raise SystemExit(2)
+        if not os.path.isfile(args.filepath):
+            print(f"❌ Input path is not a file: {args.filepath}")
+            raise SystemExit(2)
 
         if args.dry_run:
             raise SystemExit(0)

@@ -1,19 +1,19 @@
+# Python
 /__pycache__/
+.venv/
 *.pyc
-.DS_Store
-/TMS20/*
-/TMS20_censored/*
-TMS20/*.mkv
-*.mkv
-*.mp4
-*.avi
-*.mov
+
+# media files
+/data/*
+/reports/*
 *.mp3
-*.csv
-*.json
 
 ### macOS ###
 # General
 .DS_Store
 .AppleDouble
 .LSOverride
+
+# user data
+muted_words.csv
+output.json

@@ -1,178 +1,248 @@
-# Grandma Filter 🎧🚫
 
-Grandma Filter is a command-line tool that automatically **detects profanity in spoken audio**, creates a **censored audio track** (mute or beep), and **muxes it back into the original video** alongside the untouched original audio.
 
-The output video:
-- Keeps the **original audio track**
-- Adds a **new default audio track** named `<Language>_censored`
-- Optionally includes a **subtitle track** that displays `[CENSORED]` during censored moments
+# Grandma Filter 🤬🚫🎧
+
+Grandma Filter is a **command-line tool** that automatically **detects profanity in spoken audio**, creates a **censored audio track** (mute or beep), and **muxes it back into the original video** alongside the untouched original audio.
+
+It is designed to be:
+- **Accurate when possible** (word-level timestamps)
+- **Safe when not** (fallback to estimated timing so swears are not missed)
+- **Fast enough for full TV episodes**
+- **Structured for future GUI / app integration**
+
+---
+
+## What the Output Looks Like
+
+For a typical video input:
+
+- **Video stream:** unchanged
+- **Audio track 1 (default):** `<Language>_censored`
+- **Audio track 2:** original audio
+- **Report files:** JSON + CSV describing exactly what was censored
+
+Most players (VLC, Plex, mpv) let you switch audio tracks at playback time.
+
+---
+
+## Platform Support
+
+- **macOS:** fully supported and tested (Apple Silicon)
+- **Windows:** untested
+- **Linux:** untested
 
 ---
 
 ## Requirements
 
-- macOS or Linux (tested on macOS Apple Silicon)
-- Python **3.11+** (recommended: run inside a virtual environment)
-- `ffmpeg` available on your PATH
-- Internet connection (for Whisper models on first run)
+### System Requirements
 
-### Python dependencies (recommended setup)
+- Python **3.11 or 3.12** (recommended: 3.12)
+- `ffmpeg` available on your system `PATH`
+- Internet connection on first run (Whisper models download automatically)
+
+---
+
+## Beginner Setup (Step-by-Step)
+
+These steps assume **no prior Python project setup experience**.
+
+### 1️⃣ Install Python
+
+Make sure Python is installed:
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install openai-whisper whisperx torch
+python3 --version
 ```
 
-> ⚠️ On macOS with Homebrew Python, **do not install packages system-wide**. Use a virtual environment.
+You should see `Python 3.11.x` or `Python 3.12.x`.
+
+---
+
+### 2️⃣ Create and activate a virtual environment
+
+From the project directory:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+You should now see `(.venv)` in your terminal prompt.
+
+> ⚠️ **Do not install packages globally.** Always use the virtual environment.
+
+---
+
+### 3️⃣ Install Python dependencies
+
+Install required packages:
+
+```bash
+pip install faster-whisper torch
+```
+
+> On Apple Silicon, this will run efficiently on CPU. GPU acceleration is not required.
+
+---
+
+### 4️⃣ Install ffmpeg
+
+#### macOS (Homebrew)
+```bash
+brew install ffmpeg
+```
+
+Verify:
+```bash
+ffmpeg -version
+```
+
+#### Windows (experimental)
+Install ffmpeg and ensure it is on your PATH (via winget, chocolatey, or manual install).
 
 ---
 
 ## Usage
 
-> **Tip:** Use your project virtual environment (recommended):
->
-> ```bash
-> source venv/bin/activate
-> ```
-
-### Single file mode
+Activate your virtual environment first:
 
 ```bash
-python3 main.py <input_file>
-```
-
-- `<input_file>`: path to a single media file (e.g., `.mkv`, `.mp4`, `.mov`, `.avi`)
-- Output is written next to the input as `<input>_censored<ext>`
-- You can override the output path using `--output <file>` (single-file mode only).
-
-### Directory mode (non-recursive)
-
-```bash
-python3 main.py --dir <folder>
-```
-
-- Processes all supported media files in the folder (non-recursive)
-- Skips files that already end in `_censored` by default
-
-### All flags
-
-| Flag | Meaning | Notes |
-|---|---|---|
-| `-b`, `--beep` | Use a beep instead of mute for censored words | Default is **mute** |
-| `--dir <folder>` | Process all supported files in a directory (non-recursive) | Mutually exclusive with `<input_file>` |
-| `--output <file>` | Output file path (single-file mode only). Overrides default `_censored` naming | Mutually exclusive with `--dir` and cannot be combined with `--in-place` |
-| `--out-dir <folder>` | Output directory (directory mode only). Defaults to input directory | Only valid with `--dir` and cannot be combined with `--in-place` |
-| `--ext <ext>` | Restrict which extensions are processed | Repeatable. Example: `--ext mkv --ext mp4`. If omitted, defaults to `mp4,mov,mkv,avi` |
-| `--dry-run` | Print what would be processed and output names, but do not run Whisper or FFmpeg | Works in both single-file and directory mode |
-| `--no-skip-censored` | Also process files that already end in `_censored` | Only matters in directory mode |
-| `--in-place` | Replace the original file with the censored output | Uses an atomic replace after a successful run |
-
-### Examples
-
-Mute (default):
-
-```bash
-python3 main.py "input.mkv"
-```
-
-Beep:
-
-```bash
-python3 main.py "input.mkv" --beep
-```
-
-```bash
-# Single file with custom output path
-python3 main.py "input.mkv" --output "./out/clean.mkv"
-```
-
-Batch process a folder, only MKV and MP4:
-
-```bash
-python3 main.py --dir ./videos --ext mkv --ext mp4
-```
-
-```bash
-# Directory mode with separate output folder
-python3 main.py --dir ./videos --out-dir ./out
-```
-
-Dry-run:
-
-```bash
-python3 main.py --dir ./videos --dry-run
-```
-
-Force re-processing of already-censored files:
-
-```bash
-python3 main.py --dir ./videos --no-skip-censored
-```
-
-In-place replacement (single file):
-
-```bash
-python3 main.py "input.mkv" --in-place
-```
-
-In-place replacement (directory):
-
-```bash
-python3 main.py --dir ./videos --in-place
+source .venv/bin/activate
 ```
 
 ---
 
-## Output Details
+### Single File Mode
 
-For an English-language input video:
+```bash
+python main.py <input_file>
+```
 
-- **Audio Track 1 (default):** `English_censored`
-- **Audio Track 2:** `English`
-- **Subtitles:** `[CENSORED]` appears during muted/beeped sections
+Example:
+```bash
+python main.py "video.mkv"
+```
 
-Most players (VLC, Plex, mpv) allow switching audio tracks at playback time.
+Result:
+- Creates `video_censored.mkv` next to the original file
+- Original file is untouched
 
 ---
 
-## How It Works (High-Level)
+### Beep Instead of Mute
 
-1. Extracts audio from the input video
-2. Transcribes speech using Whisper
-3. Detects target words and precise timestamps
-4. Creates a censored audio track (mute or beep)
-5. Auto-detects spoken language
-6. Muxes video + original audio + censored audio + subtitles into a single file
+```bash
+python main.py "video.mkv" --beep
+```
+
+---
+
+### Directory (Batch) Mode
+
+Process all supported media files in a folder (non-recursive):
+
+```bash
+python main.py --dir ./videos
+```
+
+By default:
+- Files ending in `_censored` are skipped
+- Output is written next to the originals
+
+---
+
+### Directory Mode with Separate Output Folder
+
+```bash
+python main.py --dir ./videos --out-dir ./videos_censored
+```
+
+- Originals stay untouched
+- All censored outputs go to `./videos_censored/`
+
+---
+
+### Restrict File Extensions
+
+```bash
+python main.py --dir ./videos --ext mkv --ext mp4
+```
+
+---
+
+### Dry Run (No Processing)
+
+```bash
+python main.py --dir ./videos --dry-run
+```
+
+Shows what *would* be processed without running Whisper or ffmpeg.
+
+---
+
+### In-Place Replacement (Use Carefully)
+
+Single file:
+```bash
+python main.py "video.mkv" --in-place
+```
+
+Directory:
+```bash
+python main.py --dir ./videos --in-place
+```
+
+The original file is replaced **only after** a successful run.
+
+---
+
+## Reports & Logs
+
+Each run produces:
+
+- `reports/<filename>.<timestamp>.report.json`
+- `muted_words.csv`
+
+The report includes:
+- Input and output file paths
+- Detected language
+- Censor mode (mute / beep)
+- Number of segments
+- Word-level hits
+- Estimated hits (fallback timing)
+- Final censor ranges
+- Total processing time
+
+---
+
+## How Profanity Detection Works
+
+1. Audio is extracted from the video
+2. Speech is transcribed using **faster-whisper**
+3. Profanity words are matched against a target list
+4. **If word-level timestamps exist**, they are used directly
+5. **If word timestamps are missing**, timing is **estimated from transcript text** so swears are not missed
+6. Censor ranges are normalized and merged
+7. A censored audio track is generated and muxed back into the video
+
+> This hybrid approach prioritizes **coverage over elegance** to avoid missed profanity.
 
 ---
 
 ## Notes & Tips
 
-- Batch mode is **non-recursive by design** (safe default)
-- Temporary files are cleaned between each run
-- Errors in one file will **not stop batch processing**
-- Subtitle behavior varies slightly between players
-
----
-
-## Example
-
-```bash
-python3 main.py --dir ./clips --beep
-```
-
-Produces:
-
-```text
-clip1_censored.mp4
-clip2_censored.mp4
-clip3_censored.mp4
-```
+- Batch mode is **non-recursive by design** (safer default)
+- Temporary files are cleaned between runs
+- Errors in one file **do not stop** batch processing
+- Timing is conservative to ensure audible profanity is fully muted
 
 ---
 
 ## License / Disclaimer
 
 This project is for educational and personal use.
-Accuracy of speech recognition and profanity detection depends on the quality of the input audio and the Whisper model used.
+Speech recognition accuracy depends on audio quality and model behavior.
+Censor timing may be approximate when word-level timestamps are unavailable.
+
+---

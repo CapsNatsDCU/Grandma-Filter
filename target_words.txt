@@ -8,7 +8,6 @@ Bitch
 Bullshit
 Cock
 Cocksucker
-Crap
 Cunt
 Damn
 Dick
@@ -57,14 +56,10 @@ Bastards
 Bitchy
 Bitches
 Bitching
-Bullcrap
 Bullshit
 Bullshits
 Bullshitter
 Bullshitters
-Craps
-Crappy
-Crapola
 Cockhead
 Cockheads
 Cocks
@@ -156,21 +151,7 @@ Motherfuckers
 Motherfucking
 Motherfucked
 
-# Common spellings with missing vowels / clipped forms
-Fck
-Fk
-Fuk
-Fuks
-Sh1t
-Shyt
-B1tch
-Btch
-Dmn
-Gd
-
 # Common concatenations / no-space phrases
-JesusChrist
-JesusFuckingChrist
 Forfucksake
 Forfucksakes
 Forfucksake
@@ -205,11 +186,3 @@ Skanks
 Cuntface
 Cuntfaces
 Cunty
-
-# Mild-to-moderate insults often desired in "family friendly" filters
-Craphead
-Crapheads
-Butthead
-Buttheads
-Assbutt
-Assbutts
