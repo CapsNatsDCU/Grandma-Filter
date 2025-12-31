@@ -284,14 +284,6 @@ def main(filepath: str, censor_mode: str) -> None:
         output_video_file=output_video,
     )
 
-    # DEBUG: print full transcript again right before report
-    print("\n===== TRANSCRIPT BEFORE REPORT (DEBUG) =====")
-    for seg in segments:
-        txt = str(getattr(seg, "text", "")).strip()
-        if txt:
-            print(txt)
-    print("===== END TRANSCRIPT =====\n")
-
     # 6) Write per-file JSON report (app-ready interface)
     try:
         detected_language = whisperCalls.load_detected_language("output.json")

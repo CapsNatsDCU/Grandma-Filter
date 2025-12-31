@@ -1,5 +1,3 @@
-Alex
-
 Arse
 Ass
 Asshole
@@ -9,12 +7,7 @@ Bullshit
 Cock
 Cocksucker
 Cunt
-Damn
-Dick
-Dickhead
-Douche
 Dumbass
-Fag
 Fuck
 Fucker
 Fuckface
@@ -32,7 +25,6 @@ Shithead
 Slut
 Twat
 Wanker
-A**hole
 Ahole
 Aholes
 Asshat
@@ -68,12 +60,6 @@ Cumming
 Cums
 Cumshot
 Cumshots
-Dick
-Dicks
-Dicking
-Dicked
-Dickhead
-Dickheads
 Dildo
 Dildos
 Douchebag
@@ -97,8 +83,6 @@ Fup
 Goddamn
 Goddammit
 Goddamnit
-Hell
-Hells
 Holyshit
 Horseshit
 Shit
@@ -118,24 +102,16 @@ Dipshit
 Dipshits
 Dumbshit
 Dumbshits
-Piss
-Pissed
-Pisser
-Pissers
-Pisshead
-Pissheads
 Prick
 Pricks
 Pricking
 Pussy
 Pussies
-Pussycat
 Slut
 Sluts
 Slutty
 Sonofabitch
 Sonofabitches
-SOB
 Twat
 Twats
 Wank
@@ -144,8 +120,6 @@ Wanking
 Wanked
 Wanker
 Wankers
-WTF
-STFU
 Motherfucker
 Motherfuckers
 Motherfucking
@@ -160,21 +134,14 @@ Ohmygod
 Omfg
 
 # British/AU variants
-Bloodyhell
-Bollock
-Bollocks
 Bugger
 Buggers
 Buggered
 Buggering
-Git
-Gits
 Knob
 Knobs
 Knobhead
 Knobheads
-Tosser
-Tossers
 
 # Sexual profanity / insults
 Arsehole
