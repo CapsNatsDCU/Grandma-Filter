@@ -204,6 +204,60 @@ def _check_executable(name: str, version_args: List[str]) -> CheckItem:
     )
 
 
+def _install_ffmpeg() -> None:
+    sysname = platform.system()
+    if sysname == "Darwin":
+        if not shutil.which("brew"):
+            print("[install] ❌ Homebrew not found; install it first: https://brew.sh/")
+            return
+        print("[install] Installing ffmpeg via Homebrew …")
+        rc, out = _run(["brew", "install", "ffmpeg"], timeout_s=900)
+        if rc == 0:
+            print("[install] ✅ Installed ffmpeg")
+        else:
+            print(f"[install] ❌ Failed to install ffmpeg: {out}")
+        return
+
+    if sysname == "Linux":
+        if shutil.which("apt-get"):
+            print("[install] Installing ffmpeg via apt-get …")
+            rc, out = _run(["sudo", "apt-get", "update"], timeout_s=900)
+            if rc != 0:
+                print(f"[install] ❌ apt-get update failed: {out}")
+                return
+            rc, out = _run(["sudo", "apt-get", "install", "-y", "ffmpeg"], timeout_s=900)
+            if rc == 0:
+                print("[install] ✅ Installed ffmpeg")
+            else:
+                print(f"[install] ❌ Failed to install ffmpeg: {out}")
+            return
+        if shutil.which("yum"):
+            print("[install] Installing ffmpeg via yum …")
+            rc, out = _run(["sudo", "yum", "install", "-y", "ffmpeg"], timeout_s=900)
+            if rc == 0:
+                print("[install] ✅ Installed ffmpeg")
+            else:
+                print(f"[install] ❌ Failed to install ffmpeg: {out}")
+            return
+
+        print("[install] ❌ No supported Linux package manager found for ffmpeg.")
+        return
+
+    if sysname == "Windows":
+        if shutil.which("winget"):
+            print("[install] Installing ffmpeg via winget …")
+            rc, out = _run(["winget", "install", "--id", "Gyan.FFmpeg", "-e"], timeout_s=900)
+            if rc == 0:
+                print("[install] ✅ Installed ffmpeg")
+            else:
+                print(f"[install] ❌ Failed to install ffmpeg: {out}")
+            return
+        print("[install] ❌ winget not found; install ffmpeg manually and add it to PATH.")
+        return
+
+    print("[install] ❌ Unsupported OS for automatic ffmpeg install.")
+
+
 def _check_module(mod: str, required: bool) -> CheckItem:
     # Fast path: “is it installed?”
     pkg_name = mod.replace("_", "-")  # common convention
@@ -470,7 +524,11 @@ def run_checks(install: bool = False) -> CheckReport:
     items.append(_check_repo_root_contract())
 
     # Required executables
-    items.append(_check_executable("ffmpeg", ["-version"]))
+    ffmpeg_ci = _check_executable("ffmpeg", ["-version"])
+    items.append(ffmpeg_ci)
+    if install and (not ffmpeg_ci.ok):
+        _install_ffmpeg()
+        items.append(_check_executable("ffmpeg", ["-version"]))
 
     # Required Python modules
     for m in REQUIRED_MODULES:
@@ -553,7 +611,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_check = sub.add_parser("check", help="Verify environment + dependencies")
-    p_check.add_argument("--install", action="store_true", help="Attempt to pip install missing REQUIRED modules")
+    p_check.add_argument(
+        "--install",
+        action="store_true",
+        help="Attempt to install missing REQUIRED dependencies (pip modules + ffmpeg)",
+    )
     p_check.add_argument("--json", action="store_true", help="Emit JSON report (app-friendly)")
 
     sub.add_parser("cleanup", help="Remove temporary files (mini_audio, output.*)")

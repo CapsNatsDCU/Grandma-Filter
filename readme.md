@@ -103,6 +103,17 @@ Install ffmpeg and ensure it is on your PATH (via winget, chocolatey, or manual 
 
 ---
 
+### ✅ Optional: Let SWhelper install missing dependencies
+
+If you prefer, you can let the built‑in helper install missing **required** dependencies
+(Python modules + ffmpeg) and re-check your setup:
+
+```bash
+python SWhelper.py check --install
+```
+
+---
+
 ## Usage
 
 Activate your virtual environment first:
