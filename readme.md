@@ -112,6 +112,26 @@ If you prefer, you can let the built‑in helper install missing **required** de
 python SWhelper.py check --install
 ```
 
+Note: SWhelper will prompt before installing **ffmpeg**, since it is installed
+system-wide (outside the venv). Python packages are installed inside the venv.
+Use `--yes` to skip that prompt:
+
+```bash
+python SWhelper.py check --install --yes
+```
+
+### What installs outside the venv?
+
+- `ffmpeg` (system package via Homebrew/apt/yum/winget)
+
+### Uninstall everything (full cleanup)
+
+This removes temp files, uninstalls Python deps, deletes `.venv`, and uninstalls ffmpeg:
+
+```bash
+python SWhelper.py uninstall
+```
+
 ---
 
 ## Usage
@@ -138,6 +158,27 @@ python main.py "video.mkv"
 Result:
 - Creates `video_censored.mkv` next to the original file
 - Original file is untouched
+
+### Automatic dependency check on every run
+
+By default, `main.py` **auto-creates the venv (if missing), relaunches itself
+inside that venv**, and then runs the SWhelper installer/check every time you run it.
+It will attempt to install missing dependencies (Python packages + ffmpeg).
+If Python 3.12 (or 3.11) is available, it will use that for the venv to keep
+Whisper dependencies compatible.
+On macOS, if Python 3.12 is missing, it will offer to install `python@3.12`
+via Homebrew automatically.
+
+Flags:
+- `--no-check` to skip the check/installer
+- `--yes-install` to auto-approve the system-wide ffmpeg install prompt
+
+You can still activate the venv manually if you prefer:
+
+```bash
+source .venv/bin/activate
+python main.py "video.mkv"
+```
 
 ---
 

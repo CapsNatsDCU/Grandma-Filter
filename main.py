@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import time
+import sys
 from typing import Iterable
 
 import FFMcalls
@@ -320,6 +321,9 @@ def main(filepath: str, censor_mode: str) -> None:
 
 
 if __name__ == "__main__":
+    # Always ensure we are running inside the project venv (auto-create if missing)
+    SWhelper.ensure_runtime_ready(sys.argv)
+
     parser = argparse.ArgumentParser(description="Grandma Filter – speech-based audio censoring tool")
 
     source = parser.add_mutually_exclusive_group(required=True)
@@ -362,6 +366,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Replace original files with censored output (safe atomic replace)",
     )
+    parser.add_argument(
+        "--no-check",
+        action="store_true",
+        help="Skip the automatic dependency check/installer (not recommended)",
+    )
+    parser.add_argument(
+        "--yes-install",
+        action="store_true",
+        help="Assume yes for system-wide installs during the auto-check (ffmpeg)",
+    )
 
     args = parser.parse_args()
 
@@ -378,25 +392,26 @@ if __name__ == "__main__":
         print("❌ --in-place cannot be combined with --output or --out-dir")
         raise SystemExit(2)
 
-    # Strict gatekeeper (updated SWhelper)
-    report = SWhelper.run_checks(install=False)
-    if not report.required_ok:
-        print("❌ Gatekeeper failed. Run: python SWhelper.py check --json")
-        for it in report.items:
-            # Only print failing required items (keeps output readable)
-            if not it.ok and it.name in {
-                "env:venv",
-                "repo:root_contract",
-                "ffmpeg",
-                "torch:accel",
-                "import:FFMcalls",
-                "import:FFMcalls.make_mini_audio",
-                *{f"python:{m}" for m in getattr(SWhelper, "REQUIRED_MODULES", [])},
-            }:
-                print(f"❌ {it.name}: {it.details}")
-                if it.recommendation:
-                    print(f"   -> {it.recommendation}")
-        raise SystemExit(2)
+    # Strict gatekeeper + auto-installer (unless --no-check)
+    if not args.no_check:
+        report = SWhelper.run_checks(install=True, assume_yes=bool(args.yes_install))
+        if not report.required_ok:
+            print("❌ Gatekeeper failed. Run: python SWhelper.py check --json")
+            for it in report.items:
+                # Only print failing required items (keeps output readable)
+                if not it.ok and it.name in {
+                    "env:venv",
+                    "repo:root_contract",
+                    "ffmpeg",
+                    "torch:accel",
+                    "import:FFMcalls",
+                    "import:FFMcalls.make_mini_audio",
+                    *{f"python:{m}" for m in getattr(SWhelper, "REQUIRED_MODULES", [])},
+                }:
+                    print(f"❌ {it.name}: {it.details}")
+                    if it.recommendation:
+                        print(f"   -> {it.recommendation}")
+            raise SystemExit(2)
 
     censor_mode = "beep" if args.beep else "mute"
     print(f"Censor mode: {censor_mode}")

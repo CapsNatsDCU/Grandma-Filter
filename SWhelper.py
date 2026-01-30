@@ -14,7 +14,9 @@ Usage:
   python SWhelper.py check
   python SWhelper.py check --json
   python SWhelper.py check --install
+  python SWhelper.py check --install --yes
   python SWhelper.py cleanup
+  python SWhelper.py uninstall
 
 Exit codes:
   0 = all required checks passed
@@ -87,16 +89,185 @@ def _run(cmd, timeout_s: int | None = 15):
         return 3, f"{type(e).__name__}: {e}"
 
 
+def _python_in_venv(py_path: str, venv_path: str) -> bool:
+    try:
+        py = Path(py_path).resolve()
+        venv = Path(venv_path).resolve()
+        return str(py).startswith(str(venv))
+    except Exception:
+        return False
+
+
 def _is_venv() -> bool:
-    return bool(os.environ.get("VIRTUAL_ENV")) or (
-        getattr(sys, "base_prefix", sys.prefix) != sys.prefix
-    )
+    base_prefix = getattr(sys, "base_prefix", sys.prefix)
+    if base_prefix != sys.prefix:
+        return True
+    venv = os.environ.get("VIRTUAL_ENV")
+    if venv and _python_in_venv(sys.executable, venv):
+        return True
+    return False
+
+
+def _target_python() -> str:
+    """Prefer the active venv's Python if available; fall back to sys.executable."""
+    if _is_venv():
+        return sys.executable
+
+    venv = os.environ.get("VIRTUAL_ENV")
+    if venv:
+        # macOS/Linux
+        cand = Path(venv) / "bin" / "python"
+        if cand.exists():
+            return str(cand)
+        # Windows
+        cand = Path(venv) / "Scripts" / "python.exe"
+        if cand.exists():
+            return str(cand)
+
+    return sys.executable
+
+
+def _find_preferred_python() -> str:
+    """Prefer Python 3.12 (or 3.11) for compatibility with faster-whisper."""
+    for exe in ("python3.12", "python3.11"):
+        path = shutil.which(exe)
+        if path:
+            return path
+    return sys.executable
+
+
+def _maybe_install_python312() -> Optional[str]:
+    if platform.system() != "Darwin":
+        return None
+    if shutil.which("python3.12"):
+        return shutil.which("python3.12")
+    if not shutil.which("brew"):
+        return None
+    if not _confirm("Python 3.12 is recommended. Install via Homebrew now?"):
+        return None
+    print("[install] Installing python@3.12 via Homebrew …")
+    rc, out = _run(["brew", "install", "python@3.12"], timeout_s=900)
+    if rc != 0:
+        print(f"[install] ❌ Failed to install python@3.12: {out}")
+        return None
+    return shutil.which("python3.12")
+
+
+def _python_version(py_path: str) -> str:
+    rc, out = _run([py_path, "-c", "import sys; print(sys.version.split()[0])"], timeout_s=8)
+    return out.strip() if rc == 0 else ""
+
+
+def _ensure_venv_exists(path: str = ".venv") -> Optional[str]:
+    """Create .venv if missing. Returns venv python path if available."""
+    venv_path = Path(path)
+    if not venv_path.exists():
+        print(f"[setup] Creating virtual environment at {venv_path} …")
+        py = _find_preferred_python()
+        rc, out = _run([py, "-m", "venv", str(venv_path)], timeout_s=900)
+        if rc != 0:
+            print(f"[setup] ❌ Failed to create venv: {out}")
+            return None
+    # Resolve venv python
+    cand = venv_path / "bin" / "python"
+    if cand.exists():
+        return str(cand)
+    cand = venv_path / "Scripts" / "python.exe"
+    if cand.exists():
+        return str(cand)
+    print("[setup] ❌ Could not locate venv python after creation.")
+    return None
+
+
+def ensure_runtime_ready(argv: List[str], *, assume_yes: bool = False) -> None:
+    """Ensure we are running inside the project venv; relaunch if needed."""
+    if _is_venv():
+        vpy_ver = _python_version(sys.executable)
+        if vpy_ver and vpy_ver.split(".")[0:2] not in [["3", "12"], ["3", "11"]]:
+            preferred = _find_preferred_python()
+            pref_ver = _python_version(preferred)
+            if pref_ver == "" and platform.system() == "Darwin":
+                # Try to install 3.12 if missing
+                p312 = _maybe_install_python312()
+                if p312:
+                    preferred = p312
+                    pref_ver = _python_version(preferred)
+            if pref_ver and pref_ver.split(".")[0:2] in [["3", "12"], ["3", "11"]]:
+                print(f"[setup] Detected venv Python {vpy_ver}; recreating with {pref_ver} for compatibility …")
+                try:
+                    shutil.rmtree(".venv")
+                except Exception as e:
+                    print(f"[setup] ❌ Failed to remove .venv: {type(e).__name__}: {e}")
+                    raise SystemExit(2)
+                vpy = _ensure_venv_exists(".venv")
+                if not vpy:
+                    raise SystemExit(2)
+                print("[setup] Relaunching with venv Python …")
+                env = os.environ.copy()
+                env["VIRTUAL_ENV"] = str(Path(".venv").resolve())
+                env["GF_RELAUNCHED"] = "1"
+                os.execve(vpy, [vpy] + argv, env)
+            return
+        return
+
+    if os.environ.get("GF_RELAUNCHED") == "1":
+        print("[setup] ❌ Relaunch attempted but still not in venv. Aborting.")
+        raise SystemExit(2)
+
+    # If VIRTUAL_ENV is set but not actually active, try to relaunch using it.
+    venv_env = os.environ.get("VIRTUAL_ENV")
+    if venv_env:
+        cand = Path(venv_env) / "bin" / "python"
+        if not cand.exists():
+            cand = Path(venv_env) / "Scripts" / "python.exe"
+        if cand.exists():
+            vpy = str(cand)
+        else:
+            vpy = None
+    else:
+        vpy = None
+
+    if not vpy:
+        vpy = _ensure_venv_exists(".venv")
+    if not vpy:
+        raise SystemExit(2)
+
+    # If the venv Python is too new for faster-whisper deps, try to recreate with 3.12/3.11.
+    vpy_ver = _python_version(vpy)
+    if vpy_ver and vpy_ver.split(".")[0:2] not in [["3", "12"], ["3", "11"]]:
+        preferred = _find_preferred_python()
+        pref_ver = _python_version(preferred)
+        if pref_ver == "" and platform.system() == "Darwin":
+            p312 = _maybe_install_python312()
+            if p312:
+                preferred = p312
+                pref_ver = _python_version(preferred)
+        if pref_ver and pref_ver.split(".")[0:2] in [["3", "12"], ["3", "11"]]:
+            print(f"[setup] Detected venv Python {vpy_ver}; recreating with {pref_ver} for compatibility …")
+            try:
+                shutil.rmtree(".venv")
+            except Exception as e:
+                print(f"[setup] ❌ Failed to remove .venv: {type(e).__name__}: {e}")
+                raise SystemExit(2)
+            vpy = _ensure_venv_exists(".venv")
+            if not vpy:
+                raise SystemExit(2)
+
+    # Relaunch using venv Python
+    print("[setup] Relaunching with venv Python …")
+    env = os.environ.copy()
+    env["VIRTUAL_ENV"] = str(Path(".venv").resolve())
+    env["GF_RELAUNCHED"] = "1"
+    os.execve(vpy, [vpy] + argv, env)
 
 
 def _python_identity() -> Dict[str, Any]:
+    py = _target_python()
+    rc, out = _run([py, "-c", "import sys; print(sys.version.split()[0])"], timeout_s=8)
+    py_ver = out.strip() if rc == 0 else sys.version.split()[0]
     return {
-        "executable": sys.executable,
-        "version": sys.version.split()[0],
+        "executable": py,
+        "version": py_ver,
         "prefix": sys.prefix,
         "base_prefix": getattr(sys, "base_prefix", sys.prefix),
         "venv": _is_venv(),
@@ -112,8 +283,9 @@ def _python_identity() -> Dict[str, Any]:
 
 def _pip_identity() -> Dict[str, Any]:
     pip_path = shutil.which("pip")
+    py = _target_python()
     # Never let pip identity wedge the gatekeeper.
-    rc, out = _run([sys.executable, "-m", "pip", "--version"], timeout_s=8)
+    rc, out = _run([py, "-m", "pip", "--version"], timeout_s=8)
     return {
         "pip_on_path": pip_path,
         "pip_module": out if rc == 0 else None,
@@ -204,11 +376,14 @@ def _check_executable(name: str, version_args: List[str]) -> CheckItem:
     )
 
 
-def _install_ffmpeg() -> None:
+def _install_ffmpeg(*, assume_yes: bool = False) -> None:
     sysname = platform.system()
     if sysname == "Darwin":
         if not shutil.which("brew"):
             print("[install] ❌ Homebrew not found; install it first: https://brew.sh/")
+            return
+        if (not assume_yes) and (not _confirm("ffmpeg will be installed system-wide via Homebrew. Proceed?")):
+            print("[install] Skipped ffmpeg install.")
             return
         print("[install] Installing ffmpeg via Homebrew …")
         rc, out = _run(["brew", "install", "ffmpeg"], timeout_s=900)
@@ -220,6 +395,9 @@ def _install_ffmpeg() -> None:
 
     if sysname == "Linux":
         if shutil.which("apt-get"):
+            if (not assume_yes) and (not _confirm("ffmpeg will be installed system-wide via apt-get. Proceed?")):
+                print("[install] Skipped ffmpeg install.")
+                return
             print("[install] Installing ffmpeg via apt-get …")
             rc, out = _run(["sudo", "apt-get", "update"], timeout_s=900)
             if rc != 0:
@@ -232,6 +410,9 @@ def _install_ffmpeg() -> None:
                 print(f"[install] ❌ Failed to install ffmpeg: {out}")
             return
         if shutil.which("yum"):
+            if (not assume_yes) and (not _confirm("ffmpeg will be installed system-wide via yum. Proceed?")):
+                print("[install] Skipped ffmpeg install.")
+                return
             print("[install] Installing ffmpeg via yum …")
             rc, out = _run(["sudo", "yum", "install", "-y", "ffmpeg"], timeout_s=900)
             if rc == 0:
@@ -245,6 +426,9 @@ def _install_ffmpeg() -> None:
 
     if sysname == "Windows":
         if shutil.which("winget"):
+            if (not assume_yes) and (not _confirm("ffmpeg will be installed system-wide via winget. Proceed?")):
+                print("[install] Skipped ffmpeg install.")
+                return
             print("[install] Installing ffmpeg via winget …")
             rc, out = _run(["winget", "install", "--id", "Gyan.FFmpeg", "-e"], timeout_s=900)
             if rc == 0:
@@ -259,24 +443,33 @@ def _install_ffmpeg() -> None:
 
 
 def _check_module(mod: str, required: bool) -> CheckItem:
-    # Fast path: “is it installed?”
+    py = _target_python()
     pkg_name = mod.replace("_", "-")  # common convention
-    installed = False
-    try:
-        importlib.metadata.version(pkg_name)
-        installed = True
-    except Exception:
-        try:
-            importlib.metadata.version(mod)
-            installed = True
-        except Exception:
-            installed = False
+
+    # Check installation via target Python to avoid mismatch with venv
+    check_code = (
+        "import importlib.metadata as m\n"
+        "name = %r\n"
+        "ok = False\n"
+        "try:\n"
+        "  m.version(name)\n"
+        "  ok = True\n"
+        "except Exception:\n"
+        "  try:\n"
+        "    m.version(%r)\n"
+        "    ok = True\n"
+        "  except Exception:\n"
+        "    ok = False\n"
+        "print('OK' if ok else 'NO')\n"
+    ) % (pkg_name, mod)
+    rc, out = _run([py, "-c", check_code], timeout_s=15)
+    installed = rc == 0 and (out.strip().endswith("OK"))
 
     if not installed:
         reco = (
-            f"{sys.executable} -m pip install -U {mod}"
+            f"{py} -m pip install -U {mod}"
             if required
-            else f"Optional: {sys.executable} -m pip install -U {mod}"
+            else f"Optional: {py} -m pip install -U {mod}"
         )
         return CheckItem(
             name=f"python:{mod}",
@@ -297,7 +490,7 @@ def _check_module(mod: str, required: bool) -> CheckItem:
     # For everything else, keep the subprocess import check
     try:
         p = subprocess.run(
-            [sys.executable, "-c", f"import {mod}"],
+            [py, "-c", f"import {mod}"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -313,9 +506,9 @@ def _check_module(mod: str, required: bool) -> CheckItem:
             ok=False,
             details=f"import failed (rc={p.returncode}): {out[:4000]}",
             recommendation=(
-                f"{sys.executable} -m pip install -U {mod}"
+                f"{py} -m pip install -U {mod}"
                 if required
-                else f"Optional: {sys.executable} -m pip install -U {mod}"
+                else f"Optional: {py} -m pip install -U {mod}"
             ),
         )
     except subprocess.TimeoutExpired:
@@ -361,7 +554,7 @@ except Exception as e:
 
     try:
         p = subprocess.run(
-            [sys.executable, "-c", code],
+            [_target_python(), "-c", code],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -484,15 +677,95 @@ def _check_ffmcalls_strict() -> List[CheckItem]:
 
 
 def _install_module(module_name: str) -> None:
-    print(f"[install] Installing {module_name} into {sys.executable} …")
-    rc, out = _run([sys.executable, "-m", "pip", "install", "-U", module_name])
+    if not _is_venv():
+        print(
+            f"[install] ⚠️ Skipping {module_name}: not in a virtual environment. "
+            "Activate .venv and re-run to avoid PEP 668 system Python restrictions."
+        )
+        return
+    py = _target_python()
+    print(f"[install] Installing {module_name} into {py} …")
+    rc, out = _run([py, "-m", "pip", "install", "-U", module_name], timeout_s=900)
     if rc == 0:
         print(f"[install] ✅ Installed {module_name}")
     else:
         print(f"[install] ❌ Failed to install {module_name}: {out}")
 
 
-def run_checks(install: bool = False) -> CheckReport:
+def _uninstall_module(module_name: str) -> None:
+    print(f"[uninstall] Uninstalling {module_name} from {sys.executable} …")
+    rc, out = _run([sys.executable, "-m", "pip", "uninstall", "-y", module_name], timeout_s=300)
+    if rc == 0:
+        print(f"[uninstall] ✅ Uninstalled {module_name}")
+    else:
+        print(f"[uninstall] ❌ Failed to uninstall {module_name}: {out}")
+
+
+def _uninstall_ffmpeg() -> None:
+    sysname = platform.system()
+    if sysname == "Darwin":
+        if not shutil.which("brew"):
+            print("[uninstall] ❌ Homebrew not found; cannot uninstall ffmpeg automatically.")
+            return
+        print("[uninstall] Uninstalling ffmpeg via Homebrew …")
+        rc, out = _run(["brew", "uninstall", "ffmpeg"], timeout_s=900)
+        if rc == 0:
+            print("[uninstall] ✅ Uninstalled ffmpeg")
+        else:
+            print(f"[uninstall] ❌ Failed to uninstall ffmpeg: {out}")
+        return
+
+    if sysname == "Linux":
+        if shutil.which("apt-get"):
+            print("[uninstall] Uninstalling ffmpeg via apt-get …")
+            rc, out = _run(["sudo", "apt-get", "remove", "-y", "ffmpeg"], timeout_s=900)
+            if rc == 0:
+                print("[uninstall] ✅ Uninstalled ffmpeg")
+            else:
+                print(f"[uninstall] ❌ Failed to uninstall ffmpeg: {out}")
+            return
+        if shutil.which("yum"):
+            print("[uninstall] Uninstalling ffmpeg via yum …")
+            rc, out = _run(["sudo", "yum", "remove", "-y", "ffmpeg"], timeout_s=900)
+            if rc == 0:
+                print("[uninstall] ✅ Uninstalled ffmpeg")
+            else:
+                print(f"[uninstall] ❌ Failed to uninstall ffmpeg: {out}")
+            return
+        print("[uninstall] ❌ No supported Linux package manager found for ffmpeg.")
+        return
+
+    if sysname == "Windows":
+        if shutil.which("winget"):
+            print("[uninstall] Uninstalling ffmpeg via winget …")
+            rc, out = _run(["winget", "uninstall", "--id", "Gyan.FFmpeg", "-e"], timeout_s=900)
+            if rc == 0:
+                print("[uninstall] ✅ Uninstalled ffmpeg")
+            else:
+                print(f"[uninstall] ❌ Failed to uninstall ffmpeg: {out}")
+            return
+        print("[uninstall] ❌ winget not found; uninstall ffmpeg manually.")
+        return
+
+    print("[uninstall] ❌ Unsupported OS for automatic ffmpeg uninstall.")
+
+
+def _remove_venv(path: str = ".venv") -> None:
+    venv_path = Path(path)
+    if not venv_path.exists():
+        print(f"[uninstall] .venv not found at {venv_path}")
+        return
+    if not venv_path.is_dir():
+        print(f"[uninstall] .venv exists but is not a directory: {venv_path}")
+        return
+    try:
+        shutil.rmtree(venv_path)
+        print("[uninstall] ✅ Removed .venv directory")
+    except Exception as e:
+        print(f"[uninstall] ❌ Failed to remove .venv: {type(e).__name__}: {e}")
+
+
+def run_checks(install: bool = False, *, assume_yes: bool = False) -> CheckReport:
     items: List[CheckItem] = []
     pyinfo = _python_identity()
     pipinfo = _pip_identity()
@@ -525,22 +798,26 @@ def run_checks(install: bool = False) -> CheckReport:
 
     # Required executables
     ffmpeg_ci = _check_executable("ffmpeg", ["-version"])
-    items.append(ffmpeg_ci)
     if install and (not ffmpeg_ci.ok):
-        _install_ffmpeg()
-        items.append(_check_executable("ffmpeg", ["-version"]))
+        _install_ffmpeg(assume_yes=assume_yes)
+        ffmpeg_ci = _check_executable("ffmpeg", ["-version"])
+    items.append(ffmpeg_ci)
 
     # Required Python modules
     for m in REQUIRED_MODULES:
         ci = _check_module(m, required=True)
-        items.append(ci)
         if install and (not ci.ok):
             _install_module(m)
-            items.append(_check_module(m, required=True))
+            ci = _check_module(m, required=True)
+        items.append(ci)
 
-    # Optional modules
+    # Optional modules (install if requested)
     for m in OPTIONAL_MODULES:
-        items.append(_check_module(m, required=False))
+        ci = _check_module(m, required=False)
+        if install and (not ci.ok):
+            _install_module(m)
+            ci = _check_module(m, required=False)
+        items.append(ci)
 
     # Torch accel (STRICT on Apple Silicon)
     items.append(_check_torch_accel_strict())
@@ -558,9 +835,15 @@ def run_checks(install: bool = False) -> CheckReport:
         *{f"python:{m}" for m in REQUIRED_MODULES},
     }
 
-    required_ok = True
+    # Use the latest status per item name
+    latest: Dict[str, CheckItem] = {}
     for it in items:
-        if it.name in required_names and not it.ok:
+        latest[it.name] = it
+
+    required_ok = True
+    for name in required_names:
+        it = latest.get(name)
+        if it is not None and not it.ok:
             required_ok = False
 
     return CheckReport(required_ok=required_ok, items=items, python=pyinfo, pip=pipinfo)
@@ -604,6 +887,45 @@ def clean_up(project_root: Optional[Path] = None) -> int:
     return 0
 
 
+def _confirm(prompt: str) -> bool:
+    try:
+        resp = input(f"{prompt} [y/N]: ").strip().lower()
+        return resp in {"y", "yes"}
+    except EOFError:
+        return False
+
+
+def full_uninstall(yes: bool = False, force: bool = False) -> int:
+    if not yes:
+        ok = _confirm(
+            "This will remove temp files, uninstall required Python packages, remove .venv, and uninstall ffmpeg. Continue?"
+        )
+        if not ok:
+            print("Aborted.")
+            return 2
+
+    # 1) Temp files in repo
+    clean_up()
+
+    # 2) Python deps (required only; those are what --install installs)
+    if not _is_venv() and not force:
+        print(
+            "[uninstall] ⚠️ Not in a virtual environment; skipping pip uninstalls. "
+            "Re-run inside the venv or pass --force to allow uninstalling from current Python."
+        )
+    else:
+        for m in REQUIRED_MODULES:
+            _uninstall_module(m)
+
+    # 3) Remove venv
+    _remove_venv(".venv")
+
+    # 4) System ffmpeg
+    _uninstall_ffmpeg()
+
+    return 0
+
+
 # ---------- CLI ----------
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -616,16 +938,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Attempt to install missing REQUIRED dependencies (pip modules + ffmpeg)",
     )
+    p_check.add_argument(
+        "--yes",
+        action="store_true",
+        help="Assume yes for system-wide installs (ffmpeg)",
+    )
     p_check.add_argument("--json", action="store_true", help="Emit JSON report (app-friendly)")
 
     sub.add_parser("cleanup", help="Remove temporary files (mini_audio, output.*)")
+    p_uninstall = sub.add_parser("uninstall", help="Full uninstall (temp files, venv, deps, ffmpeg)")
+    p_uninstall.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+    p_uninstall.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow pip uninstalls even if not in a venv (use with care)",
+    )
 
     args = parser.parse_args(argv)
 
     if args.cmd == "cleanup":
         return clean_up()
+    if args.cmd == "uninstall":
+        return full_uninstall(yes=bool(args.yes), force=bool(args.force))
 
-    report = run_checks(install=bool(args.install))
+    report = run_checks(install=bool(args.install), assume_yes=bool(args.yes))
 
     if args.json:
         print(report.to_json())
