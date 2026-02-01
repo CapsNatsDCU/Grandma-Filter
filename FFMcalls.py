@@ -18,6 +18,7 @@ Exports:
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -26,6 +27,9 @@ from typing import Optional
 
 def _run_ffmpeg(cmd: list[str]) -> None:
     """Run an ffmpeg command and raise a helpful error if it fails."""
+    if cmd and cmd[0] == "ffmpeg" and os.environ.get("GF_FFMPEG_QUIET", "1") != "0":
+        # Insert quiet flags right after ffmpeg
+        cmd = [cmd[0], "-hide_banner", "-loglevel", "error", "-nostats"] + cmd[1:]
     try:
         subprocess.run(cmd, check=True)
     except FileNotFoundError as e:
@@ -103,6 +107,7 @@ def make_mini_audio(
     end: Optional[float] = None,
     duration: Optional[float] = None,
     output_path: str = "mini.mp3",
+    quiet: bool = False,
 ) -> str:
     """Create a small audio clip from `input_media`.
 
@@ -128,9 +133,10 @@ def make_mini_audio(
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        "ffmpeg",
-        "-y",
+    cmd = ["ffmpeg", "-y"]
+    if quiet:
+        cmd += ["-hide_banner", "-loglevel", "error", "-nostats"]
+    cmd += [
         "-ss",
         f"{start_s}",
         "-to",

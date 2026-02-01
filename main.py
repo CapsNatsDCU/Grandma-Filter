@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import time
 import sys
+import threading
 from typing import Iterable
 
 import FFMcalls
@@ -11,12 +12,41 @@ import processText
 import SWhelper
 import whisperCalls
 
+LOG = print
+LOG_FILE = None
+
+
+def set_logger(fn) -> None:
+    global LOG
+    LOG = fn
+
+
+def set_log_file(path: str) -> None:
+    global LOG_FILE
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        LOG_FILE = open(path, "a", encoding="utf-8")
+    except Exception:
+        LOG_FILE = None
+
+
+def log_line(msg: str) -> None:
+    LOG(msg)
+    if LOG_FILE:
+        try:
+            LOG_FILE.write(str(msg) + "\n")
+            LOG_FILE.flush()
+        except Exception:
+            pass
+
+
+
 
 def checkFile(path: str) -> None:
     if os.path.exists(path):
-        print(f"The file '{path}' exists.")
+        LOG(f"The file '{path}' exists.")
     else:
-        print(f"The file '{path}' does not exist.")
+        LOG(f"The file '{path}' does not exist.")
 
 
 def _cleanup_temp_outputs() -> None:
@@ -101,9 +131,10 @@ def _extract_audio(input_media: str, output_mp3: str = "output.mp3") -> None:
                     continue
 
     # Fallback: run ffmpeg directly
-    cmd = [
-        "ffmpeg",
-        "-y",
+    cmd = ["ffmpeg", "-y"]
+    if os.environ.get("GF_FFMPEG_QUIET", "1") != "0":
+        cmd += ["-hide_banner", "-loglevel", "error", "-nostats"]
+    cmd += [
         "-i",
         input_media,
         "-vn",
@@ -113,7 +144,7 @@ def _extract_audio(input_media: str, output_mp3: str = "output.mp3") -> None:
         "2",
         output_mp3,
     ]
-    print(f"Extracting audio via ffmpeg -> {output_mp3}")
+    LOG(f"Extracting audio via ffmpeg -> {output_mp3}")
     subprocess.run(cmd, check=True)
 
 
@@ -160,37 +191,111 @@ def main(
     verify_models: list[str] | None = None,
     verify_pad: float = 0.30,
     debug: bool = False,
+    no_subs: bool = False,
+    subs_raw: bool = False,
 ) -> dict | None:
     start_time = time.time()
     timings: dict[str, float] = {}
     t0 = time.time()
+    last_progress_line = ""
+    log = log_line
+
+    def _load_last_timings() -> dict[str, float]:
+        try:
+            if not os.path.isdir("reports"):
+                return {}
+            reports = [
+                os.path.join("reports", f)
+                for f in os.listdir("reports")
+                if f.endswith(".report.json")
+            ]
+            if not reports:
+                return {}
+            reports.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            with open(reports[0], "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("timings", {}) or {}
+        except Exception:
+            return {}
+
+    expected_timings = _load_last_timings()
+    default_expected = {
+        "extract": 10.0,
+        "transcribe": 90.0,
+        "ranges": 5.0,
+        "censor": 10.0,
+        "mux": 10.0,
+    }
+
+    def _render_bar(pct: float, width: int = 20) -> str:
+        pct = max(0.0, min(1.0, pct))
+        filled = int(round(pct * width))
+        return "[" + ("#" * filled) + ("-" * (width - filled)) + f"] {int(pct*100):3d}%"
+
+    def _print_progress(line: str) -> None:
+        nonlocal last_progress_line
+        last_progress_line = line
+        # overwrite the current line in-place; cap width to avoid terminal wrap
+        max_width = 72
+        print("\r" + line[:max_width].ljust(max_width), end="", flush=True)
+
+    def _stage_progress(stage: str, pct: float) -> None:
+        if progress_cb:
+            progress_cb(stage, pct)
+        else:
+            _print_progress(f"{stage:<8} {_render_bar(pct)}")
+
+    def _run_stage(stage: str, pct_start: float, pct_end: float, fn):
+        expected = float(expected_timings.get(stage, 0.0) or 0.0)
+        if expected <= 0.0:
+            expected = float(default_expected.get(stage, 0.0) or 0.0)
+        stop_evt = threading.Event()
+
+        def _ticker():
+            if expected <= 0.0:
+                return
+            while not stop_evt.is_set():
+                elapsed = time.time() - t_start
+                frac = min(0.99, elapsed / expected) if expected > 0 else 0.0
+                pct = pct_start + (pct_end - pct_start) * frac
+                _stage_progress(stage, pct)
+                time.sleep(0.1)
+
+        t_start = time.time()
+        thr = threading.Thread(target=_ticker, daemon=True)
+        thr.start()
+        try:
+            return fn()
+        finally:
+            stop_evt.set()
+            thr.join(timeout=0.2)
+            _stage_progress(stage, pct_end)
 
     _cleanup_temp_outputs()
 
     checkFile(filepath)
     # Strict gatekeeper: input must exist and be a real file (fail fast before ffmpeg)
     if not os.path.exists(filepath):
-        print(f"❌ Input file not found: {filepath}")
-        print("Tip: include the full filename with extension (e.g., .mkv/.mp4) and use quotes if needed.")
+        log(f"❌ Input file not found: {filepath}")
+        log("Tip: include the full filename with extension (e.g., .mkv/.mp4) and use quotes if needed.")
         raise SystemExit(2)
     if not os.path.isfile(filepath):
-        print(f"❌ Input path is not a file: {filepath}")
+        log(f"❌ Input path is not a file: {filepath}")
         raise SystemExit(2)
 
     target_words = processText.load_target_words("target_words.txt")
 
-    _extract_audio(filepath, "output.mp3")
+    _run_stage("extract", 0.00, 0.33, lambda: _extract_audio(filepath, "output.mp3"))
     timings["extract_audio_s"] = round(time.time() - t0, 3)
-    if progress_cb:
-        progress_cb("extract", 0.33)
+    _stage_progress("extract", 0.33)
     checkFile("output.mp3")
 
     # Produces output.json (segments)
     t0 = time.time()
-    whisperCalls.run_whisper_live("output.mp3", "output.json")
+    t0 = time.time()
+    _run_stage("transcribe", 0.33, 0.66, lambda: whisperCalls.run_whisper_live("output.mp3", "output.json"))
     timings["transcribe_s"] = round(time.time() - t0, 3)
-    if progress_cb:
-        progress_cb("transcribe", 0.66)
+    _stage_progress("transcribe", 0.66)
     checkFile("output.json")
 
     segments = processText.load_segments("output.json")
@@ -232,6 +337,7 @@ def main(
                         start=clip_start,
                         end=clip_end,
                         output_path=mini_path,
+                        quiet=True,
                     )
                     cfg = whisperCalls.TranscribeConfig(model_name=model_name, language=detected_language)
                     data = whisperCalls.transcribe_to_dict(mini_path, cfg=cfg)
@@ -264,13 +370,15 @@ def main(
 
     # 2) Compute absolute time ranges to censor (in seconds)
     t0 = time.time()
-    raw_ranges = processText.build_censor_ranges(
-        segments=segments,
-        target_words=target_words,
-        pad=0.02,
-        low_confidence_threshold=low_conf_threshold,
-        verifier=_verify_low_confidence,
-    )
+    def _build_ranges():
+        return processText.build_censor_ranges(
+            segments=segments,
+            target_words=target_words,
+            pad=0.02,
+            low_confidence_threshold=low_conf_threshold,
+            verifier=_verify_low_confidence,
+        )
+    raw_ranges = _run_stage("ranges", 0.66, 0.75, _build_ranges)
     timings["build_ranges_s"] = round(time.time() - t0, 3)
 
     ranges = _normalize_censor_ranges(raw_ranges)
@@ -281,12 +389,12 @@ def main(
     if len(ranges) == 0 and len(raw_ranges) == 0:
         flagged = sum(1 for s in segments if getattr(s, "contains_target_word", False))
         if flagged > 0:
-            print(f"⚠ Debug: {flagged} segment(s) flagged, but 0 censor ranges built. Check transcription output + target word matching.")
+            log(f"⚠ Debug: {flagged} segment(s) flagged, but 0 censor ranges built. Check transcription output + target word matching.")
 
     if duration_s > 0.0:
-        print(f"Censor ranges: {len(raw_ranges)} → {len(ranges)} after normalization + clamp (duration={duration_s:.2f}s)")
+        log(f"Censor ranges: {len(raw_ranges)} → {len(ranges)} after normalization + clamp (duration={duration_s:.2f}s)")
     else:
-        print(f"Censor ranges: {len(raw_ranges)} → {len(ranges)} after normalization")
+        log(f"Censor ranges: {len(raw_ranges)} → {len(ranges)} after normalization")
 
         
     import csv
@@ -374,25 +482,27 @@ def main(
     processText.words_removed = 0  # will be set after logging
 
     csv_path, hit_count, granularity, hits_abs = _log_muted_words(filepath, segments)
-    print(f"Logged muted hits ({granularity}, {hit_count}) -> {csv_path}")
+    log(f"Logged muted hits ({granularity}, {hit_count}) -> {csv_path}")
 
     processText.words_removed = hit_count
 
     # 4) Build censored audio (mute by default, beep with -b)
     t0 = time.time()
-    if not ranges:
-        print("⚠ No valid censor ranges after normalization; copying original audio")
-        shutil.copyfile("output.mp3", "output_censored.mp3")
-    else:
-        FFMcalls.censor_audio(
-            ranges=ranges,
-            input_file="output.mp3",
-            output_file="output_censored.mp3",
-            mode=censor_mode,
-            beep_freq=1000,
-            beep_volume=0.25,
-            pad=0.0
-        )
+    def _censor_audio():
+        if not ranges:
+            log("⚠ No valid censor ranges after normalization; copying original audio")
+            shutil.copyfile("output.mp3", "output_censored.mp3")
+        else:
+            FFMcalls.censor_audio(
+                ranges=ranges,
+                input_file="output.mp3",
+                output_file="output_censored.mp3",
+                mode=censor_mode,
+                beep_freq=1000,
+                beep_volume=0.25,
+                pad=0.0
+            )
+    _run_stage("censor", 0.75, 0.90, _censor_audio)
     timings["censor_audio_s"] = round(time.time() - t0, 3)
     checkFile("output_censored.mp3")
 
@@ -402,22 +512,30 @@ def main(
     output_video = f"{base}_censored{ext}"
 
     srt_path = None
-    if not args.no_subs:
+    if not no_subs:
         srt_path = f"{base}_censored.srt"
-        _write_srt(hits_abs, srt_path, raw_words=bool(args.subs_raw))
-        print(f"Wrote censored words SRT -> {srt_path}")
+        _write_srt(hits_abs, srt_path, raw_words=bool(subs_raw))
+        log(f"Wrote censored words SRT -> {srt_path}")
 
-    print("MUX VIDEO:", filepath)
-    print("OUTPUT VIDEO:", output_video)
+    log(f"MUX VIDEO: {filepath}")
+    log(f"OUTPUT VIDEO: {output_video}")
     t0 = time.time()
-    FFMcalls.replace_audio_track(
-        video_file=filepath,
-        censored_audio="output_censored.mp3",
-        original_audio="output.mp3",
-        output_video_file=output_video,
-        subtitle_file=srt_path,
+    _run_stage(
+        "mux",
+        0.90,
+        1.0,
+        lambda: FFMcalls.replace_audio_track(
+            video_file=filepath,
+            censored_audio="output_censored.mp3",
+            original_audio="output.mp3",
+            output_video_file=output_video,
+            subtitle_file=srt_path,
+        ),
     )
     timings["mux_s"] = round(time.time() - t0, 3)
+    _stage_progress("mux", 1.0)
+    if last_progress_line:
+        print("")  # move past the progress line
     if progress_cb:
         progress_cb("mux", 1.0)
 
@@ -448,7 +566,7 @@ def main(
         import json
         json.dump(report, f, indent=2, ensure_ascii=False)
 
-    print(f"Wrote report -> {report_path}")
+    log(f"Wrote report -> {report_path}")
 
 
     elapsed_time = time.time() - start_time
@@ -456,245 +574,269 @@ def main(
     return report
 
 
-if __name__ == "__main__":
-    # Always ensure we are running inside the project venv (auto-create if missing)
-    SWhelper.ensure_runtime_ready(sys.argv)
+def cli_main():
+        log = log_line
+        set_log_file(os.path.join("reports", "run.log"))
+        # Always ensure we are running inside the project venv (auto-create if missing)
+        SWhelper.ensure_runtime_ready(sys.argv)
 
-    parser = argparse.ArgumentParser(description="Grandma Filter – speech-based audio censoring tool")
+        parser = argparse.ArgumentParser(description="Grandma Filter – speech-based audio censoring tool")
 
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("filepath", nargs="?", help="Input video or audio file")
-    source.add_argument("--dir", dest="directory", help="Process all supported media files in a directory (non-recursive)")
+        source = parser.add_mutually_exclusive_group(required=True)
+        source.add_argument("filepath", nargs="?", help="Input video or audio file")
+        source.add_argument("--dir", dest="directory", help="Process all supported media files in a directory (non-recursive)")
 
-    parser.add_argument(
-        "--output",
-        dest="output_file",
-        default=None,
-        help="Output file path (single-file mode only). Overrides the default _censored naming.",
-    )
-    parser.add_argument(
-        "--out-dir",
-        dest="out_dir",
-        default=None,
-        help="Output directory (directory mode only). Defaults to the input directory.",
-    )
-
-    parser.add_argument("-b", "--beep", action="store_true", help="Use beep instead of mute for censored words")
-    parser.add_argument(
-        "--ext",
-        dest="extensions",
-        action="append",
-        default=None,
-        help="File extension to include (repeatable). Example: --ext mp4 --ext mov. Default: mp4,mov,mkv,avi",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print what would be processed and outputs, but do not run ffmpeg/whisper",
-    )
-    parser.add_argument(
-        "--no-skip-censored",
-        action="store_true",
-        help="Also process files that already end in _censored",
-    )
-    parser.add_argument(
-        "--in-place",
-        action="store_true",
-        help="Replace original files with censored output (safe atomic replace)",
-    )
-    parser.add_argument(
-        "--no-check",
-        action="store_true",
-        help="Skip the automatic dependency check/installer (not recommended)",
-    )
-    parser.add_argument(
-        "--yes-install",
-        action="store_true",
-        help="Assume yes for system-wide installs during the auto-check (ffmpeg)",
-    )
-    parser.add_argument(
-        "--low-conf",
-        type=float,
-        default=0.6,
-        help="Low-confidence cutoff for target words; below this triggers verification (default: 0.6)",
-    )
-    parser.add_argument(
-        "--verify-models",
-        type=str,
-        default="small,medium,large",
-        help="Comma-separated models for low-confidence verification (default: small,medium,large)",
-    )
-    parser.add_argument(
-        "--verify-pad",
-        type=float,
-        default=0.30,
-        help="Seconds to pad around low-confidence word for verification (default: 0.30)",
-    )
-    parser.add_argument(
-        "--no-subs",
-        action="store_true",
-        help="Do not mux the censored-words subtitle track",
-    )
-    parser.add_argument(
-        "--subs-raw",
-        action="store_true",
-        help="Subtitle track uses the full censored word instead of masking (e.g., 'fuck' vs 'f---')",
-    )
-
-    args = parser.parse_args()
-
-    # Validate flag combinations
-    if args.output_file and args.directory:
-        print("❌ --output is only valid in single-file mode (do not use with --dir)")
-        raise SystemExit(2)
-
-    if args.out_dir and not args.directory:
-        print("❌ --out-dir is only valid with --dir (directory mode)")
-        raise SystemExit(2)
-
-    if args.in_place and (args.output_file or args.out_dir):
-        print("❌ --in-place cannot be combined with --output or --out-dir")
-        raise SystemExit(2)
-
-    # Strict gatekeeper + auto-installer (unless --no-check)
-    if not args.no_check:
-        report = SWhelper.run_checks(install=True, assume_yes=bool(args.yes_install))
-        if not report.required_ok:
-            print("❌ Gatekeeper failed. Run: python SWhelper.py check --json")
-            for it in report.items:
-                # Only print failing required items (keeps output readable)
-                if not it.ok and it.name in {
-                    "env:venv",
-                    "repo:root_contract",
-                    "ffmpeg",
-                    "torch:accel",
-                    "import:FFMcalls",
-                    "import:FFMcalls.make_mini_audio",
-                    *{f"python:{m}" for m in getattr(SWhelper, "REQUIRED_MODULES", [])},
-                }:
-                    print(f"❌ {it.name}: {it.details}")
-                    if it.recommendation:
-                        print(f"   -> {it.recommendation}")
-            raise SystemExit(2)
-
-    censor_mode = "beep" if args.beep else "mute"
-    print(f"Censor mode: {censor_mode}")
-
-    # Default extensions
-    extensions = args.extensions or ["mp4", "mov", "mkv", "avi"]
-
-    if args.directory:
-        directory = args.directory
-        if not os.path.isdir(directory):
-            print(f"❌ Not a directory: {directory}")
-            raise SystemExit(2)
-
-        files = _iter_media_files(directory, extensions, skip_censored=(not args.no_skip_censored))
-
-        if not files:
-            print(f"No matching media files found in: {directory}")
-            raise SystemExit(0)
-
-        print(f"Found {len(files)} file(s) in {directory}")
-
-        for idx, path in enumerate(files, start=1):
-            base, ext = os.path.splitext(path)
-
-            # Output location
-            out_dir = args.out_dir or os.path.dirname(path)
-            os.makedirs(out_dir, exist_ok=True)
-            out_name = os.path.basename(base) + f"_censored{ext}"
-            out_video = os.path.join(out_dir, out_name)
-
-            print(f"\n[{idx}/{len(files)}] {path}")
-            print(f"    -> output: {out_video}")
-
-            if args.dry_run:
-                continue
-
-            try:
-                main(
-                    path,
-                    censor_mode,
-                    low_conf_threshold=float(args.low_conf),
-                    verify_models=[m.strip() for m in args.verify_models.split(",") if m.strip()],
-                    verify_pad=float(args.verify_pad),
-                )
-
-                # If output directory differs from input folder, move the default output into `out_video`
-                default_out = os.path.splitext(path)[0] + "_censored" + os.path.splitext(path)[1]
-                if out_video != default_out:
-                    if os.path.exists(default_out):
-                        os.replace(default_out, out_video)
-                    else:
-                        print(f"    ⚠ Expected output missing: {default_out}")
-
-
-                if args.in_place:
-                    # Atomically replace original with censored output
-                    if os.path.exists(out_video):
-                        os.replace(out_video, path)
-                        print(f"    ✔ Replaced in place: {path}")
-                    else:
-                        print(f"    ⚠ Expected output missing: {out_video}")
-            except Exception as e:
-                # Keep going on errors in batch mode
-                print(f"❌ Failed: {path}")
-                print(f"   {type(e).__name__}: {e}")
-                continue
-
-        raise SystemExit(0)
-
-    # Single-file mode
-    if args.filepath:
-        base, ext = os.path.splitext(args.filepath)
-        out_video = args.output_file or f"{base}_censored{ext}"
-
-        if args.out_dir:
-            print("❌ --out-dir is only valid with --dir (directory mode)")
-            raise SystemExit(2)
-
-        print("INPUT:", args.filepath)
-        print("OUTPUT:", out_video) #AHHHH
-
-        # Strict gatekeeper: input must exist before we call ffmpeg
-        if not os.path.exists(args.filepath):
-            print(f"❌ Input file not found: {args.filepath}")
-            print("Tip: include the full filename with extension (e.g., .mkv/.mp4) and use quotes if needed.")
-            raise SystemExit(2)
-        if not os.path.isfile(args.filepath):
-            print(f"❌ Input path is not a file: {args.filepath}")
-            raise SystemExit(2)
-
-        if args.dry_run:
-            raise SystemExit(0)
-
-        main(
-            args.filepath,
-            censor_mode,
-            low_conf_threshold=float(args.low_conf),
-            verify_models=[m.strip() for m in args.verify_models.split(",") if m.strip()],
-            verify_pad=float(args.verify_pad),
+        parser.add_argument(
+            "--output",
+            dest="output_file",
+            default=None,
+            help="Output file path (single-file mode only). Overrides the default _censored naming.",
+        )
+        parser.add_argument(
+            "--out-dir",
+            dest="out_dir",
+            default=None,
+            help="Output directory (directory mode only). Defaults to the input directory.",
         )
 
-        # If the user specified --output, rename/move the produced default output into place
-        if args.output_file:
-            default_out = f"{base}_censored{ext}"
-            if os.path.exists(default_out):
-                os.makedirs(os.path.dirname(args.output_file) or ".", exist_ok=True)
-                os.replace(default_out, args.output_file)
-                print(f"✔ Wrote output: {args.output_file}")
-            else:
-                print(f"⚠ Expected output missing: {default_out}")
+        parser.add_argument("-b", "--beep", action="store_true", help="Use beep instead of mute for censored words")
+        parser.add_argument(
+            "--ext",
+            dest="extensions",
+            action="append",
+            default=None,
+            help="File extension to include (repeatable). Example: --ext mp4 --ext mov. Default: mp4,mov,mkv,avi",
+        )
+        parser.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Print what would be processed and outputs, but do not run ffmpeg/whisper",
+        )
+        parser.add_argument(
+            "--no-skip-censored",
+            action="store_true",
+            help="Also process files that already end in _censored",
+        )
+        parser.add_argument(
+            "--in-place",
+            action="store_true",
+            help="Replace original files with censored output (safe atomic replace)",
+        )
+        parser.add_argument(
+            "--no-check",
+            action="store_true",
+            help="Skip the automatic dependency check/installer (not recommended)",
+        )
+        parser.add_argument(
+            "--yes-install",
+            action="store_true",
+            help="Assume yes for system-wide installs during the auto-check (ffmpeg)",
+        )
+        parser.add_argument(
+            "--low-conf",
+            type=float,
+            default=0.6,
+            help="Low-confidence cutoff for target words; below this triggers verification (default: 0.6)",
+        )
+        parser.add_argument(
+            "--verify-models",
+            type=str,
+            default="small,medium,large",
+            help="Comma-separated models for low-confidence verification (default: small,medium,large)",
+        )
+        parser.add_argument(
+            "--verify-pad",
+            type=float,
+            default=0.30,
+            help="Seconds to pad around low-confidence word for verification (default: 0.30)",
+        )
+        parser.add_argument(
+            "--no-subs",
+            action="store_true",
+            help="Do not mux the censored-words subtitle track",
+        )
+        parser.add_argument(
+            "--subs-raw",
+            action="store_true",
+            help="Subtitle track uses the full censored word instead of masking (e.g., 'fuck' vs 'f---')",
+        )
 
-        if args.in_place:
-            if os.path.exists(out_video):
-                os.replace(out_video, args.filepath)
-                print(f"✔ Replaced in place: {args.filepath}")
-            else:
-                print(f"⚠ Expected output missing: {out_video}")
+        args = parser.parse_args()
 
-        raise SystemExit(0)
+        # Validate flag combinations
+        if args.output_file and args.directory:
+            log("❌ --output is only valid in single-file mode (do not use with --dir)")
+            raise SystemExit(2)
 
-    parser.print_usage()
-    raise SystemExit(1)
+        if args.out_dir and not args.directory:
+            log("❌ --out-dir is only valid with --dir (directory mode)")
+            raise SystemExit(2)
+
+        if args.in_place and (args.output_file or args.out_dir):
+            log("❌ --in-place cannot be combined with --output or --out-dir")
+            raise SystemExit(2)
+
+        # Strict gatekeeper + auto-installer (unless --no-check)
+        if not args.no_check:
+            report = SWhelper.run_checks(install=True, assume_yes=bool(args.yes_install))
+            if not report.required_ok:
+                log("❌ Gatekeeper failed. Run: python SWhelper.py check --json")
+                for it in report.items:
+                    # Only print failing required items (keeps output readable)
+                    if not it.ok and it.name in {
+                        "env:venv",
+                        "repo:root_contract",
+                        "ffmpeg",
+                        "torch:accel",
+                        "import:FFMcalls",
+                        "import:FFMcalls.make_mini_audio",
+                        *{f"python:{m}" for m in getattr(SWhelper, "REQUIRED_MODULES", [])},
+                    }:
+                        log(f"❌ {it.name}: {it.details}")
+                        if it.recommendation:
+                            log(f"   -> {it.recommendation}")
+                raise SystemExit(2)
+
+        censor_mode = "beep" if args.beep else "mute"
+        log(f"Censor mode: {censor_mode}")
+
+        # Default extensions
+        extensions = args.extensions or ["mp4", "mov", "mkv", "avi"]
+
+        if args.directory:
+            directory = args.directory
+            if not os.path.isdir(directory):
+                log(f"❌ Not a directory: {directory}")
+                raise SystemExit(2)
+
+            files = _iter_media_files(directory, extensions, skip_censored=(not args.no_skip_censored))
+
+            if not files:
+                log(f"No matching media files found in: {directory}")
+                raise SystemExit(0)
+
+            log(f"Found {len(files)} file(s) in {directory}")
+            total_files = len(files)
+
+            def _batch_bar(i: int) -> str:
+                pct = i / total_files if total_files else 1.0
+                width = 20
+                filled = int(round(pct * width))
+                return "[" + ("#" * filled) + ("-" * (width - filled)) + f"] {int(pct*100):3d}%"
+
+            for idx, path in enumerate(files, start=1):
+                base, ext = os.path.splitext(path)
+
+                # Output location
+                out_dir = args.out_dir or os.path.dirname(path)
+                os.makedirs(out_dir, exist_ok=True)
+                out_name = os.path.basename(base) + f"_censored{ext}"
+                out_video = os.path.join(out_dir, out_name)
+
+                log(f"\n[{idx}/{len(files)}] {path}")
+                line = f"Batch {_batch_bar(idx-1)}"
+                print("\r" + line[:72].ljust(72), end="", flush=True)
+                log(f"    -> output: {out_video}")
+
+                if args.dry_run:
+                    continue
+
+                try:
+                    main(
+                        path,
+                        censor_mode,
+                        low_conf_threshold=float(args.low_conf),
+                        verify_models=[m.strip() for m in args.verify_models.split(",") if m.strip()],
+                        verify_pad=float(args.verify_pad),
+                        no_subs=bool(args.no_subs),
+                        subs_raw=bool(args.subs_raw),
+                    )
+                    line = f"Batch {_batch_bar(idx)}"
+                    print("\r" + line[:72].ljust(72), end="", flush=True)
+                    print("")  # move past the progress line
+
+                    # If output directory differs from input folder, move the default output into `out_video`
+                    default_out = os.path.splitext(path)[0] + "_censored" + os.path.splitext(path)[1]
+                    if out_video != default_out:
+                        if os.path.exists(default_out):
+                            os.replace(default_out, out_video)
+                        else:
+                            log(f"    ⚠ Expected output missing: {default_out}")
+
+
+                    if args.in_place:
+                        # Atomically replace original with censored output
+                        if os.path.exists(out_video):
+                            os.replace(out_video, path)
+                            log(f"    ✔ Replaced in place: {path}")
+                        else:
+                            log(f"    ⚠ Expected output missing: {out_video}")
+                except Exception as e:
+                    # Keep going on errors in batch mode
+                    log(f"❌ Failed: {path}")
+                    log(f"   {type(e).__name__}: {e}")
+                    continue
+
+            raise SystemExit(0)
+
+        # Single-file mode
+        if args.filepath:
+            base, ext = os.path.splitext(args.filepath)
+            out_video = args.output_file or f"{base}_censored{ext}"
+
+            if args.out_dir:
+                log("❌ --out-dir is only valid with --dir (directory mode)")
+                raise SystemExit(2)
+
+            log(f"INPUT: {args.filepath}")
+            log(f"OUTPUT: {out_video}")
+
+            # Strict gatekeeper: input must exist before we call ffmpeg
+            if not os.path.exists(args.filepath):
+                log(f"❌ Input file not found: {args.filepath}")
+                log("Tip: include the full filename with extension (e.g., .mkv/.mp4) and use quotes if needed.")
+                raise SystemExit(2)
+            if not os.path.isfile(args.filepath):
+                log(f"❌ Input path is not a file: {args.filepath}")
+                raise SystemExit(2)
+
+            if args.dry_run:
+                raise SystemExit(0)
+
+            main(
+                args.filepath,
+                censor_mode,
+                low_conf_threshold=float(args.low_conf),
+                verify_models=[m.strip() for m in args.verify_models.split(",") if m.strip()],
+                verify_pad=float(args.verify_pad),
+                no_subs=bool(args.no_subs),
+                subs_raw=bool(args.subs_raw),
+            )
+
+            # If the user specified --output, rename/move the produced default output into place
+            if args.output_file:
+                default_out = f"{base}_censored{ext}"
+                if os.path.exists(default_out):
+                    os.makedirs(os.path.dirname(args.output_file) or ".", exist_ok=True)
+                    os.replace(default_out, args.output_file)
+                    log(f"✔ Wrote output: {args.output_file}")
+                else:
+                    log(f"⚠ Expected output missing: {default_out}")
+
+            if args.in_place:
+                if os.path.exists(out_video):
+                    os.replace(out_video, args.filepath)
+                    log(f"✔ Replaced in place: {args.filepath}")
+                else:
+                    log(f"⚠ Expected output missing: {out_video}")
+
+            raise SystemExit(0)
+
+        parser.print_usage()
+        raise SystemExit(1)
+
+def _run_main():
+    return cli_main()
+
+if __name__ == "__main__":
+    raise SystemExit(_run_main())
