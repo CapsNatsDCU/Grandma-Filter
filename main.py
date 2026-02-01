@@ -151,8 +151,19 @@ def _normalize_censor_ranges(
     return final
 
 
-def main(filepath: str, censor_mode: str) -> None:
+def main(
+    filepath: str,
+    censor_mode: str,
+    progress_cb=None,
+    *,
+    low_conf_threshold: float = 0.6,
+    verify_models: list[str] | None = None,
+    verify_pad: float = 0.30,
+    debug: bool = False,
+) -> dict | None:
     start_time = time.time()
+    timings: dict[str, float] = {}
+    t0 = time.time()
 
     _cleanup_temp_outputs()
 
@@ -169,23 +180,98 @@ def main(filepath: str, censor_mode: str) -> None:
     target_words = processText.load_target_words("target_words.txt")
 
     _extract_audio(filepath, "output.mp3")
+    timings["extract_audio_s"] = round(time.time() - t0, 3)
+    if progress_cb:
+        progress_cb("extract", 0.33)
     checkFile("output.mp3")
 
     # Produces output.json (segments)
+    t0 = time.time()
     whisperCalls.run_whisper_live("output.mp3", "output.json")
+    timings["transcribe_s"] = round(time.time() - t0, 3)
+    if progress_cb:
+        progress_cb("transcribe", 0.66)
     checkFile("output.json")
 
     segments = processText.load_segments("output.json")
+
+    try:
+        detected_language = whisperCalls.load_detected_language("output.json")
+    except Exception:
+        detected_language = None
+
+    # Low-confidence verification: escalate to bigger models for uncertain hits.
+    if verify_models is None:
+        verify_models = ["small", "medium", "large"]
+    verify_cache: dict[tuple[float, float, str], list[tuple[str, float]]] = {}
+    verify_stats = {
+        "low_conf_hits": 0,
+        "model_attempts": {m: 0 for m in verify_models},
+        "model_confirms": {m: 0 for m in verify_models},
+    }
+    exact_targets, prefix_targets = processText._parse_target_patterns(target_words)
+
+    def _verify_low_confidence(tok: str, abs_start: float, abs_end: float) -> bool:
+        clip_start = max(0.0, abs_start - verify_pad)
+        clip_end = max(clip_start + 0.3, abs_end + verify_pad)
+
+        os.makedirs("mini_audio", exist_ok=True)
+        verify_stats["low_conf_hits"] += 1
+        for model_name in verify_models:
+            verify_stats["model_attempts"][model_name] = verify_stats["model_attempts"].get(model_name, 0) + 1
+            cache_key = (round(clip_start, 3), round(clip_end, 3), model_name)
+            tokens = verify_cache.get(cache_key)
+            if tokens is None:
+                mini_path = os.path.join(
+                    "mini_audio",
+                    f"verify_{int(time.time()*1000)}_{os.getpid()}_{model_name}.mp3",
+                )
+                try:
+                    FFMcalls.make_mini_audio(
+                        input_media=filepath,
+                        start=clip_start,
+                        end=clip_end,
+                        output_path=mini_path,
+                    )
+                    cfg = whisperCalls.TranscribeConfig(model_name=model_name, language=detected_language)
+                    data = whisperCalls.transcribe_to_dict(mini_path, cfg=cfg)
+                    tokens = []
+                    for seg in data.get("segments", []):
+                        for w in seg.get("words", []) or []:
+                            ww = processText.remove_non_alpha(str(w.get("word", "")).lower())
+                            if not ww:
+                                continue
+                            prob = float(w.get("probability", 0.0) or 0.0)
+                            for t in ww.split():
+                                tokens.append((t, prob))
+                    verify_cache[cache_key] = tokens
+                finally:
+                    try:
+                        if os.path.exists(mini_path):
+                            os.remove(mini_path)
+                    except Exception:
+                        pass
+
+            for t, prob in (tokens or []):
+                if processText._token_matches(t, exact_targets, prefix_targets) and prob >= low_conf_threshold:
+                    verify_stats["model_confirms"][model_name] = verify_stats["model_confirms"].get(model_name, 0) + 1
+                    return True
+
+        return False
 
     # 1) Identify which segments contain target words
     processText.mark_segments_with_targets(segments, target_words)
 
     # 2) Compute absolute time ranges to censor (in seconds)
+    t0 = time.time()
     raw_ranges = processText.build_censor_ranges(
         segments=segments,
         target_words=target_words,
-        pad=0.02
+        pad=0.02,
+        low_confidence_threshold=low_conf_threshold,
+        verifier=_verify_low_confidence,
     )
+    timings["build_ranges_s"] = round(time.time() - t0, 3)
 
     ranges = _normalize_censor_ranges(raw_ranges)
     duration_s = FFMcalls.get_audio_duration_seconds("output.mp3")
@@ -205,21 +291,50 @@ def main(filepath: str, censor_mode: str) -> None:
         
     import csv
 
-    def _log_muted_words(file: str, segments: list) -> tuple[str, int, str]:
+    def _format_srt_time(seconds: float) -> str:
+        if seconds < 0:
+            seconds = 0.0
+        millis = int(round(seconds * 1000.0))
+        hrs = millis // 3_600_000
+        mins = (millis % 3_600_000) // 60_000
+        secs = (millis % 60_000) // 1000
+        ms = millis % 1000
+        return f"{hrs:02d}:{mins:02d}:{secs:02d},{ms:03d}"
+
+    def _mask_word(word: str, *, raw: bool) -> str:
+        w = (word or "").strip()
+        if not w:
+            return ""
+        if raw:
+            return w
+        return w[0] + ("-" * (len(w) - 1))
+
+    def _write_srt(hits_abs: list[tuple[float, float, str]], srt_path: str, *, raw_words: bool) -> None:
+        hits_abs.sort(key=lambda x: x[0])
+        with open(srt_path, "w", encoding="utf-8") as f:
+            for idx, (s, e, w) in enumerate(hits_abs, start=1):
+                f.write(f"{idx}\n")
+                f.write(f"{_format_srt_time(s)} --> {_format_srt_time(e)}\n")
+                f.write(f"{_mask_word(w, raw=raw_words)}\n\n")
+
+    def _log_muted_words(file: str, segments: list) -> tuple[str, int, str, list[tuple[float, float, str]]]:
         """Append muted-word hits to muted_words.csv.
 
         Preferred: word-level hits via segments[].words (from faster-whisper output.json).
         Fallback: if no word hits, we log flagged segments as coarse hits.
 
-        Returns (csv_path, hit_count, granularity).
+        Returns (csv_path, hit_count, granularity, hits_abs).
         """
         csv_file = "muted_words.csv"
         file_exists = os.path.isfile(csv_file)
+        hits_abs: list[tuple[float, float, str]] = []
 
         hits = processText.extract_target_word_times(
             segments=segments,
             target_words=target_words,
             mini_audio_dir="mini_audio",  # ignored; kept for compatibility
+            low_confidence_threshold=low_conf_threshold,
+            verifier=_verify_low_confidence,
         )
 
         # Determine granularity for reporting
@@ -228,13 +343,15 @@ def main(filepath: str, censor_mode: str) -> None:
         with open(csv_file, mode="a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(["file", "hit_type", "text", "start", "end", "granularity"])
+                writer.writerow(["hit_type", "text", "start", "end", "granularity", "file"])
 
             if hits:
                 for hit in hits:
-                    abs_start = max(0.0, float(hit.start))
-                    abs_end = max(abs_start, float(hit.end))
-                    writer.writerow([file, "word", hit.word, f"{abs_start:.3f}", f"{abs_end:.3f}", granularity])
+                    seg_start = float(segments[hit.segment_number].start) if hit.segment_number is not None else 0.0
+                    abs_start = max(0.0, float(hit.start) + seg_start)
+                    abs_end = max(abs_start, float(hit.end) + seg_start)
+                    writer.writerow(["word", hit.word, f"{abs_start:.3f}", f"{abs_end:.3f}", granularity, file])
+                    hits_abs.append((abs_start, abs_end, hit.word))
             else:
                 # Fallback: log the full segments that were flagged
                 for seg in segments:
@@ -242,20 +359,27 @@ def main(filepath: str, censor_mode: str) -> None:
                         text = str(getattr(seg, "text", "")).strip()
                         s = float(getattr(seg, "start", 0.0))
                         e = float(getattr(seg, "end", 0.0))
-                        writer.writerow([file, "segment", text, f"{s:.3f}", f"{e:.3f}", granularity])
+                        writer.writerow(["segment", text, f"{s:.3f}", f"{e:.3f}", granularity, file])
+                        hits_abs.append((s, e, text))
 
-        return csv_file, (len(hits) if hits else sum(1 for seg in segments if getattr(seg, "contains_target_word", False))), granularity
+        return (
+            csv_file,
+            (len(hits) if hits else sum(1 for seg in segments if getattr(seg, "contains_target_word", False))),
+            granularity,
+            hits_abs,
+        )
 
     # Keep report() consistent with what we actually censor after normalization
     # Prefer the count of word-level hits when available; otherwise count flagged segments.
     processText.words_removed = 0  # will be set after logging
 
-    csv_path, hit_count, granularity = _log_muted_words(filepath, segments)
+    csv_path, hit_count, granularity, hits_abs = _log_muted_words(filepath, segments)
     print(f"Logged muted hits ({granularity}, {hit_count}) -> {csv_path}")
 
     processText.words_removed = hit_count
 
     # 4) Build censored audio (mute by default, beep with -b)
+    t0 = time.time()
     if not ranges:
         print("⚠ No valid censor ranges after normalization; copying original audio")
         shutil.copyfile("output.mp3", "output_censored.mp3")
@@ -269,28 +393,35 @@ def main(filepath: str, censor_mode: str) -> None:
             beep_volume=0.25,
             pad=0.0
         )
+    timings["censor_audio_s"] = round(time.time() - t0, 3)
     checkFile("output_censored.mp3")
 
-    # 5) Mux censored + original into output video
+    # 5) Build censored-words subtitle file (SRT) and mux back into video
     # Default output name (caller may move/rename this when using --output/--out-dir)
     base, ext = os.path.splitext(filepath)
     output_video = f"{base}_censored{ext}"
 
+    srt_path = None
+    if not args.no_subs:
+        srt_path = f"{base}_censored.srt"
+        _write_srt(hits_abs, srt_path, raw_words=bool(args.subs_raw))
+        print(f"Wrote censored words SRT -> {srt_path}")
+
     print("MUX VIDEO:", filepath)
     print("OUTPUT VIDEO:", output_video)
+    t0 = time.time()
     FFMcalls.replace_audio_track(
         video_file=filepath,
         censored_audio="output_censored.mp3",
         original_audio="output.mp3",
         output_video_file=output_video,
+        subtitle_file=srt_path,
     )
+    timings["mux_s"] = round(time.time() - t0, 3)
+    if progress_cb:
+        progress_cb("mux", 1.0)
 
     # 6) Write per-file JSON report (app-ready interface)
-    try:
-        detected_language = whisperCalls.load_detected_language("output.json")
-    except Exception:
-        detected_language = None
-
     report = {
         "input_file": filepath,
         "output_file": output_video,
@@ -300,8 +431,11 @@ def main(filepath: str, censor_mode: str) -> None:
         "censor_granularity": granularity,
         "muted_hit_count": hit_count,
         "censor_ranges": [[float(s), float(e)] for (s, e) in ranges],
+        "media_duration_s": round(duration_s, 3),
         "processing_time_s": round(time.time() - start_time, 3),
     }
+    report["verify_stats"] = verify_stats
+    report["timings"] = timings
 
     # Write report into reports/ directory (app-friendly)
     os.makedirs("reports", exist_ok=True)
@@ -316,8 +450,10 @@ def main(filepath: str, censor_mode: str) -> None:
 
     print(f"Wrote report -> {report_path}")
 
+
     elapsed_time = time.time() - start_time
     processText.report(segments, elapsed_time)
+    return report
 
 
 if __name__ == "__main__":
@@ -375,6 +511,34 @@ if __name__ == "__main__":
         "--yes-install",
         action="store_true",
         help="Assume yes for system-wide installs during the auto-check (ffmpeg)",
+    )
+    parser.add_argument(
+        "--low-conf",
+        type=float,
+        default=0.6,
+        help="Low-confidence cutoff for target words; below this triggers verification (default: 0.6)",
+    )
+    parser.add_argument(
+        "--verify-models",
+        type=str,
+        default="small,medium,large",
+        help="Comma-separated models for low-confidence verification (default: small,medium,large)",
+    )
+    parser.add_argument(
+        "--verify-pad",
+        type=float,
+        default=0.30,
+        help="Seconds to pad around low-confidence word for verification (default: 0.30)",
+    )
+    parser.add_argument(
+        "--no-subs",
+        action="store_true",
+        help="Do not mux the censored-words subtitle track",
+    )
+    parser.add_argument(
+        "--subs-raw",
+        action="store_true",
+        help="Subtitle track uses the full censored word instead of masking (e.g., 'fuck' vs 'f---')",
     )
 
     args = parser.parse_args()
@@ -449,7 +613,13 @@ if __name__ == "__main__":
                 continue
 
             try:
-                main(path, censor_mode)
+                main(
+                    path,
+                    censor_mode,
+                    low_conf_threshold=float(args.low_conf),
+                    verify_models=[m.strip() for m in args.verify_models.split(",") if m.strip()],
+                    verify_pad=float(args.verify_pad),
+                )
 
                 # If output directory differs from input folder, move the default output into `out_video`
                 default_out = os.path.splitext(path)[0] + "_censored" + os.path.splitext(path)[1]
@@ -499,7 +669,13 @@ if __name__ == "__main__":
         if args.dry_run:
             raise SystemExit(0)
 
-        main(args.filepath, censor_mode)        
+        main(
+            args.filepath,
+            censor_mode,
+            low_conf_threshold=float(args.low_conf),
+            verify_models=[m.strip() for m in args.verify_models.split(",") if m.strip()],
+            verify_pad=float(args.verify_pad),
+        )
 
         # If the user specified --output, rename/move the produced default output into place
         if args.output_file:

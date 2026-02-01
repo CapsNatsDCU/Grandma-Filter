@@ -159,6 +159,7 @@ Result:
 - Creates `video_censored.mkv` next to the original file
 - Original file is untouched
 
+
 ### Automatic dependency check on every run
 
 By default, `main.py` **auto-creates the venv (if missing), relaunches itself
@@ -172,6 +173,26 @@ via Homebrew automatically.
 Flags:
 - `--no-check` to skip the check/installer
 - `--yes-install` to auto-approve the system-wide ffmpeg install prompt
+
+### Low-confidence verification (bigger models)
+
+If a target word is detected with low confidence, Grandma Filter re-checks a short
+audio clip using larger Whisper models (small → medium → large) and only mutes
+the word if a larger model confirms it.
+
+You can control this behavior:
+- `--low-conf 0.6` (confidence cutoff; below this triggers verification)
+- `--verify-models small,medium,large`
+- `--verify-pad 0.30` (seconds of padding around the word)
+
+### Subtitle track (censored words)
+
+By default, output videos include a **soft subtitle track** with censored words.
+
+Flags:
+- `--no-subs` to disable subtitle muxing
+- `--subs-raw` to include the full word in subtitles (default masks like `f---`)
+
 
 You can still activate the venv manually if you prefer:
 

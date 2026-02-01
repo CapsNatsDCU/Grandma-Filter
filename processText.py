@@ -41,6 +41,7 @@ class TargetWordTime:
     start: float  # relative to the mini clip
     end: float    # relative to the mini clip
     segment_number: int
+    probability: float = 0.0
 
 
 def remove_non_alpha(text: str) -> str:
@@ -97,13 +98,41 @@ def load_segments(json_path: str) -> List[Segment]:
     return segments
 
 
+def _parse_target_patterns(targets: Sequence[str]) -> tuple[set[str], list[str]]:
+    """Return (exact_tokens, prefixes) for targets. Supports suffix '*' for prefix match."""
+    exact: set[str] = set()
+    prefixes: list[str] = []
+    for t in targets:
+        if not t:
+            continue
+        tt = remove_non_alpha(t.lower())
+        if not tt:
+            continue
+        if t.strip().endswith("*"):
+            prefixes.append(tt)
+        else:
+            exact.add(tt)
+    return exact, prefixes
+
+
+def _token_matches(tok: str, exact: set[str], prefixes: list[str]) -> bool:
+    if tok in exact:
+        return True
+    for p in prefixes:
+        if tok.startswith(p):
+            return True
+    return False
+
+
 def mark_segments_with_targets(segments: List[Segment], targets: Sequence[str]) -> None:
-    """Mark segments whose text contains any target word (case-insensitive, punctuation-stripped match)."""
+    """Mark segments whose text contains any target word (case-insensitive, punctuation-stripped match).
+    Supports wildcard suffix '*', e.g. 'fuck*' matches 'fucking' and 'motherfucker' tokens.
+    """
     global segments_flagged
     segments_flagged = 0
 
     # Normalize target words once
-    norm_targets = {remove_non_alpha(t.lower()) for t in targets if t}
+    exact, prefixes = _parse_target_patterns(targets)
 
     for seg in segments:
         seg.contains_target_word = False
@@ -115,7 +144,7 @@ def mark_segments_with_targets(segments: List[Segment], targets: Sequence[str]) 
         tokens = seg_text_norm.split()
 
         for tok in tokens:
-            if tok in norm_targets:
+            if _token_matches(tok, exact, prefixes):
                 seg.contains_target_word = True
                 segments_flagged += 1
                 break
@@ -134,6 +163,9 @@ def extract_target_word_times(
     segments: List[Segment],
     target_words: Sequence[str],
     mini_audio_dir: str = "mini_audio",
+    *,
+    low_confidence_threshold: float = 0.6,
+    verifier=None,
 ) -> List[TargetWordTime]:
     """
     Return word-level hits.
@@ -142,7 +174,7 @@ def extract_target_word_times(
     """
     _ = mini_audio_dir
 
-    targets = {remove_non_alpha(w.lower()) for w in target_words}
+    exact, prefixes = _parse_target_patterns(target_words)
     hits: List[TargetWordTime] = []
 
     for seg in segments:
@@ -158,7 +190,13 @@ def extract_target_word_times(
                     continue
 
                 for tok in ww_norm.split():
-                    if tok in targets:
+                    if _token_matches(tok, exact, prefixes):
+                        # Optional verification for low-confidence hits
+                        if verifier is not None and w.probability < low_confidence_threshold:
+                            abs_start = float(w.start)
+                            abs_end = float(w.end)
+                            if not verifier(tok, abs_start, abs_end):
+                                continue
                         # faster-whisper word timestamps are absolute (global) seconds.
                         # Convert to segment-relative so build_censor_ranges can add the segment offset once.
                         start_rel = max(0.0, float(w.start) - float(seg.start) - 0.02)
@@ -169,6 +207,7 @@ def extract_target_word_times(
                                 start=start_rel,
                                 end=end_rel,
                                 segment_number=seg.number,
+                                probability=float(w.probability),
                             )
                         )
             continue
@@ -184,7 +223,10 @@ def extract_target_word_times(
         seconds_per_word = seg_duration / len(tokens)
 
         for i, tok in enumerate(tokens):
-            if tok in targets:
+            if _token_matches(tok, exact, prefixes):
+                if verifier is not None and low_confidence_threshold > 0.0:
+                    if not verifier(tok, float(start), float(end)):
+                        continue
                 start = seg.start + i * seconds_per_word
                 end = start + seconds_per_word
 
@@ -194,6 +236,7 @@ def extract_target_word_times(
                         start=start - seg.start,  # relative to segment
                         end=end - seg.start,
                         segment_number=seg.number,
+                        probability=0.0,
                     )
                 )
 
@@ -222,7 +265,10 @@ def build_censor_ranges(segments: List[Segment],
                         target_words: Sequence[str],
                         mini_audio_dir: str = "mini_audio",
                         pad: float = 0.0,
-                        merge_gap: float = 0.02) -> List[Tuple[float, float]]:
+                        merge_gap: float = 0.02,
+                        *,
+                        low_confidence_threshold: float = 0.6,
+                        verifier=None) -> List[Tuple[float, float]]:
     """Return absolute (start,end) ranges in seconds for the full audio.
 
     Preferred path: use word timestamps present in the transcription JSON (segments[].words).
@@ -230,7 +276,13 @@ def build_censor_ranges(segments: List[Segment],
     """
     global words_removed, word_hits
 
-    hits = extract_target_word_times(segments, target_words, mini_audio_dir=mini_audio_dir)
+    hits = extract_target_word_times(
+        segments,
+        target_words,
+        mini_audio_dir=mini_audio_dir,
+        low_confidence_threshold=low_confidence_threshold,
+        verifier=verifier,
+    )
     word_hits = len(hits)
 
     ranges: List[Tuple[float, float]] = []

@@ -16,8 +16,7 @@ Fucking
 Goddamn
 Hell
 Motherfucker
-Nigga
-Nigger
+Nigg*
 Prick
 Pussy
 Shit
@@ -56,6 +55,7 @@ Cockhead
 Cockheads
 Cocks
 Cum
+Cum*
 Cumming
 Cums
 Cumshot
@@ -64,6 +64,9 @@ Dildo
 Dildos
 Douchebag
 Douchebags
+Fuck*
+*Fuck*
+*Fuck
 Fucker
 Fuckers
 Fuckface
@@ -78,6 +81,7 @@ Fuckoff
 Fucked
 Fucking
 Fuckin
+Fucko
 Fucks
 Fup
 Goddamn
