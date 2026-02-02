@@ -136,6 +136,9 @@ def make_mini_audio(
     cmd = ["ffmpeg", "-y"]
     if quiet:
         cmd += ["-hide_banner", "-loglevel", "error", "-nostats"]
+    threads = os.environ.get("GF_FFMPEG_THREADS", "").strip()
+    if threads.isdigit() and int(threads) > 0:
+        cmd += ["-threads", threads]
     cmd += [
         "-ss",
         f"{start_s}",
@@ -175,6 +178,11 @@ def _ffprobe_duration_seconds(path: str) -> float:
         return float(out)
     except Exception:
         return 0.0
+
+
+def get_media_duration_seconds(path: str) -> float:
+    """Return media duration in seconds using ffprobe (0.0 on failure)."""
+    return _ffprobe_duration_seconds(path)
 
 
 def _build_mute_filter(

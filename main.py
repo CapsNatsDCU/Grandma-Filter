@@ -193,6 +193,8 @@ def main(
     debug: bool = False,
     no_subs: bool = False,
     subs_raw: bool = False,
+    model_name: str = "base",
+    ffmpeg_threads: int = 0,
 ) -> dict | None:
     start_time = time.time()
     timings: dict[str, float] = {}
@@ -214,11 +216,98 @@ def main(
             reports.sort(key=lambda p: os.path.getmtime(p), reverse=True)
             with open(reports[0], "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data.get("timings", {}) or {}
+            return {
+                "timings": data.get("timings", {}) or {},
+                "processing_time_s": float(data.get("processing_time_s", 0.0) or 0.0),
+                "media_duration_s": float(data.get("media_duration_s", 0.0) or 0.0),
+            }
         except Exception:
             return {}
 
-    expected_timings = _load_last_timings()
+    last = _load_last_timings()
+    last_timings = last.get("timings", {}) if isinstance(last, dict) else {}
+    stage_last = {
+        "extract": float(last_timings.get("extract_audio_s", 0.0) or 0.0),
+        "transcribe": float(last_timings.get("transcribe_s", 0.0) or 0.0),
+        "ranges": float(last_timings.get("build_ranges_s", 0.0) or 0.0),
+        "censor": float(last_timings.get("censor_audio_s", 0.0) or 0.0),
+        "mux": float(last_timings.get("mux_s", 0.0) or 0.0),
+    }
+    last_proc = float(last.get("processing_time_s", 0.0) or 0.0) if isinstance(last, dict) else 0.0
+    last_media = float(last.get("media_duration_s", 0.0) or 0.0) if isinstance(last, dict) else 0.0
+
+    # Default stage fractions if no history is available
+    default_fractions = {
+        "extract": 0.08,
+        "transcribe": 0.70,
+        "ranges": 0.05,
+        "censor": 0.07,
+        "mux": 0.10,
+    }
+
+    def _load_similar_fractions(duration_s: float, *, tolerance: float = 0.20, min_samples: int = 3) -> dict[str, float]:
+        """Find similar-length reports and return averaged stage fractions."""
+        if duration_s <= 0.0 or not os.path.isdir("reports"):
+            return {}
+        lower = duration_s * (1.0 - tolerance)
+        upper = duration_s * (1.0 + tolerance)
+        files = [
+            os.path.join("reports", f)
+            for f in os.listdir("reports")
+            if f.endswith(".report.json")
+        ]
+        samples = []
+        for p in files:
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                dur = float(data.get("media_duration_s", 0.0) or 0.0)
+                proc = float(data.get("processing_time_s", 0.0) or 0.0)
+                t = data.get("timings", {}) or {}
+                if dur <= 0.0 or proc <= 0.0:
+                    continue
+                if not (lower <= dur <= upper):
+                    continue
+                samples.append((proc, t))
+            except Exception:
+                continue
+
+        if len(samples) < min_samples:
+            return {}
+
+        sums = {"extract": 0.0, "transcribe": 0.0, "ranges": 0.0, "censor": 0.0, "mux": 0.0}
+        for proc, t in samples:
+            if proc <= 0.0:
+                continue
+            sums["extract"] += float(t.get("extract_audio_s", 0.0) or 0.0) / proc
+            sums["transcribe"] += float(t.get("transcribe_s", 0.0) or 0.0) / proc
+            sums["ranges"] += float(t.get("build_ranges_s", 0.0) or 0.0) / proc
+            sums["censor"] += float(t.get("censor_audio_s", 0.0) or 0.0) / proc
+            sums["mux"] += float(t.get("mux_s", 0.0) or 0.0) / proc
+
+        n = float(len(samples))
+        return {k: max(0.01, min(0.9, v / n)) for k, v in sums.items()}
+
+    # Use last report to derive stage fractions
+    fractions: dict[str, float] = {}
+    if last_proc > 0.0 and last_timings:
+        for k, v in last_timings.items():
+            if k == "extract_audio_s":
+                fractions["extract"] = max(0.01, min(0.9, float(v) / last_proc))
+            elif k == "transcribe_s":
+                fractions["transcribe"] = max(0.01, min(0.9, float(v) / last_proc))
+            elif k == "build_ranges_s":
+                fractions["ranges"] = max(0.005, min(0.5, float(v) / last_proc))
+            elif k == "censor_audio_s":
+                fractions["censor"] = max(0.005, min(0.5, float(v) / last_proc))
+            elif k == "mux_s":
+                fractions["mux"] = max(0.01, min(0.8, float(v) / last_proc))
+
+    for k, v in default_fractions.items():
+        fractions.setdefault(k, v)
+
+    # expected_total is computed after we know duration_s
+    expected_total = None
     default_expected = {
         "extract": 10.0,
         "transcribe": 90.0,
@@ -239,15 +328,23 @@ def main(
         max_width = 72
         print("\r" + line[:max_width].ljust(max_width), end="", flush=True)
 
-    def _stage_progress(stage: str, pct: float) -> None:
+    def _stage_progress(stage: str, total_pct: float, phase_pct: float) -> None:
         if progress_cb:
-            progress_cb(stage, pct)
+            progress_cb(stage, total_pct)
         else:
-            _print_progress(f"{stage:<8} {_render_bar(pct)}")
+            total_bar = _render_bar(total_pct, width=16)
+            phase_bar = _render_bar(phase_pct, width=12)
+            _print_progress(f"total {total_bar} | {stage:<8} {phase_bar}")
 
     def _run_stage(stage: str, pct_start: float, pct_end: float, fn):
-        expected = float(expected_timings.get(stage, 0.0) or 0.0)
+        expected = 0.0
+        if expected_total:
+            expected = float(expected_total * float(fractions.get(stage, 0.0)))
         if expected <= 0.0:
+            # Fall back to last timings if present (keyed by stage names)
+            expected = float(stage_last.get(stage, 0.0) or 0.0)
+        if expected <= 0.0:
+            # Final fallback: fixed defaults
             expected = float(default_expected.get(stage, 0.0) or 0.0)
         stop_evt = threading.Event()
 
@@ -258,7 +355,7 @@ def main(
                 elapsed = time.time() - t_start
                 frac = min(0.99, elapsed / expected) if expected > 0 else 0.0
                 pct = pct_start + (pct_end - pct_start) * frac
-                _stage_progress(stage, pct)
+                _stage_progress(stage, pct, frac)
                 time.sleep(0.1)
 
         t_start = time.time()
@@ -269,9 +366,17 @@ def main(
         finally:
             stop_evt.set()
             thr.join(timeout=0.2)
-            _stage_progress(stage, pct_end)
+            _stage_progress(stage, pct_end, 1.0)
 
     _cleanup_temp_outputs()
+
+    input_duration_s = FFMcalls.get_media_duration_seconds(filepath)
+    similar = _load_similar_fractions(input_duration_s)
+    if similar:
+        fractions.update(similar)
+    if last_media > 0.0 and last_proc > 0.0 and input_duration_s > 0.0:
+        rate = last_proc / last_media
+        expected_total = max(5.0, rate * input_duration_s)
 
     checkFile(filepath)
     # Strict gatekeeper: input must exist and be a real file (fail fast before ffmpeg)
@@ -285,17 +390,45 @@ def main(
 
     target_words = processText.load_target_words("target_words.txt")
 
-    _run_stage("extract", 0.00, 0.33, lambda: _extract_audio(filepath, "output.mp3"))
+    # Build cumulative progress boundaries from fractions
+    frac_extract = fractions.get("extract", 0.08)
+    frac_transcribe = fractions.get("transcribe", 0.70)
+    frac_ranges = fractions.get("ranges", 0.05)
+    frac_censor = fractions.get("censor", 0.07)
+    frac_mux = fractions.get("mux", 0.10)
+    total_frac = frac_extract + frac_transcribe + frac_ranges + frac_censor + frac_mux
+    if total_frac <= 0:
+        total_frac = 1.0
+    frac_extract /= total_frac
+    frac_transcribe /= total_frac
+    frac_ranges /= total_frac
+    frac_censor /= total_frac
+    frac_mux /= total_frac
+    b0 = 0.0
+    b1 = b0 + frac_extract
+    b2 = b1 + frac_transcribe
+    b3 = b2 + frac_ranges
+    b4 = b3 + frac_censor
+    b5 = 1.0
+
+    if ffmpeg_threads > 0:
+        os.environ["GF_FFMPEG_THREADS"] = str(ffmpeg_threads)
+    _run_stage("extract", b0, b1, lambda: _extract_audio(filepath, "output.mp3"))
     timings["extract_audio_s"] = round(time.time() - t0, 3)
-    _stage_progress("extract", 0.33)
+    _stage_progress("extract", b1, 1.0)
     checkFile("output.mp3")
 
     # Produces output.json (segments)
     t0 = time.time()
     t0 = time.time()
-    _run_stage("transcribe", 0.33, 0.66, lambda: whisperCalls.run_whisper_live("output.mp3", "output.json"))
+    _run_stage(
+        "transcribe",
+        b1,
+        b2,
+        lambda: whisperCalls.run_whisper_live("output.mp3", "output.json", model_name=model_name),
+    )
     timings["transcribe_s"] = round(time.time() - t0, 3)
-    _stage_progress("transcribe", 0.66)
+    _stage_progress("transcribe", b2, 1.0)
     checkFile("output.json")
 
     segments = processText.load_segments("output.json")
@@ -378,12 +511,17 @@ def main(
             low_confidence_threshold=low_conf_threshold,
             verifier=_verify_low_confidence,
         )
-    raw_ranges = _run_stage("ranges", 0.66, 0.75, _build_ranges)
+    raw_ranges = _run_stage("ranges", b2, b3, _build_ranges)
     timings["build_ranges_s"] = round(time.time() - t0, 3)
 
     ranges = _normalize_censor_ranges(raw_ranges)
     duration_s = FFMcalls.get_audio_duration_seconds("output.mp3")
     ranges = FFMcalls.clamp_ranges_to_duration(ranges, duration_s)
+
+    # Scale expected total by media duration (if last report has it)
+    if last_media > 0.0 and last_proc > 0.0:
+        rate = last_proc / last_media
+        expected_total = max(5.0, rate * max(1.0, duration_s))
 
     # Helpful debug when nothing gets censored despite target segments being flagged
     if len(ranges) == 0 and len(raw_ranges) == 0:
@@ -502,7 +640,7 @@ def main(
                 beep_volume=0.25,
                 pad=0.0
             )
-    _run_stage("censor", 0.75, 0.90, _censor_audio)
+    _run_stage("censor", b3, b4, _censor_audio)
     timings["censor_audio_s"] = round(time.time() - t0, 3)
     checkFile("output_censored.mp3")
 
@@ -511,9 +649,10 @@ def main(
     base, ext = os.path.splitext(filepath)
     output_video = f"{base}_censored{ext}"
 
+    out_base = os.path.splitext(output_video)[0]
     srt_path = None
     if not no_subs:
-        srt_path = f"{base}_censored.srt"
+        srt_path = f"{out_base}.srt"
         _write_srt(hits_abs, srt_path, raw_words=bool(subs_raw))
         log(f"Wrote censored words SRT -> {srt_path}")
 
@@ -522,8 +661,8 @@ def main(
     t0 = time.time()
     _run_stage(
         "mux",
-        0.90,
-        1.0,
+        b4,
+        b5,
         lambda: FFMcalls.replace_audio_track(
             video_file=filepath,
             censored_audio="output_censored.mp3",
@@ -533,7 +672,7 @@ def main(
         ),
     )
     timings["mux_s"] = round(time.time() - t0, 3)
-    _stage_progress("mux", 1.0)
+    _stage_progress("mux", 1.0, 1.0)
     if last_progress_line:
         print("")  # move past the progress line
     if progress_cb:
@@ -554,6 +693,11 @@ def main(
     }
     report["verify_stats"] = verify_stats
     report["timings"] = timings
+    if expected_total:
+        actual = report["processing_time_s"]
+        report["estimate_time_s"] = round(float(expected_total), 3)
+        report["estimate_error_s"] = round(actual - float(expected_total), 3)
+        report["estimate_bias"] = "short" if actual > float(expected_total) else "long"
 
     # Write report into reports/ directory (app-friendly)
     os.makedirs("reports", exist_ok=True)
@@ -660,6 +804,18 @@ def cli_main():
             action="store_true",
             help="Subtitle track uses the full censored word instead of masking (e.g., 'fuck' vs 'f---')",
         )
+        parser.add_argument(
+            "--model",
+            type=str,
+            default="base",
+            help="Whisper model size (tiny, base, small, medium, large). Default: base",
+        )
+        parser.add_argument(
+            "--ffmpeg-threads",
+            type=int,
+            default=0,
+            help="FFmpeg thread count (0 = auto).",
+        )
 
         args = parser.parse_args()
 
@@ -724,6 +880,7 @@ def cli_main():
                 filled = int(round(pct * width))
                 return "[" + ("#" * filled) + ("-" * (width - filled)) + f"] {int(pct*100):3d}%"
 
+            dir_reports: list[dict] = []
             for idx, path in enumerate(files, start=1):
                 base, ext = os.path.splitext(path)
 
@@ -742,7 +899,7 @@ def cli_main():
                     continue
 
                 try:
-                    main(
+                    rep = main(
                         path,
                         censor_mode,
                         low_conf_threshold=float(args.low_conf),
@@ -750,6 +907,8 @@ def cli_main():
                         verify_pad=float(args.verify_pad),
                         no_subs=bool(args.no_subs),
                         subs_raw=bool(args.subs_raw),
+                        model_name=str(args.model),
+                        ffmpeg_threads=int(args.ffmpeg_threads),
                     )
                     line = f"Batch {_batch_bar(idx)}"
                     print("\r" + line[:72].ljust(72), end="", flush=True)
@@ -763,6 +922,9 @@ def cli_main():
                         else:
                             log(f"    ⚠ Expected output missing: {default_out}")
 
+                    if rep:
+                        rep["directory_output_file"] = out_video
+                        dir_reports.append(rep)
 
                     if args.in_place:
                         # Atomically replace original with censored output
@@ -776,6 +938,15 @@ def cli_main():
                     log(f"❌ Failed: {path}")
                     log(f"   {type(e).__name__}: {e}")
                     continue
+
+            if dir_reports:
+                os.makedirs("reports", exist_ok=True)
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                report_name = f"directory_report.{stamp}.json"
+                report_path = os.path.join("reports", report_name)
+                with open(report_path, "w", encoding="utf-8") as f:
+                    json.dump({"files": dir_reports}, f, indent=2)
+                log(f"Directory report -> {report_path}")
 
             raise SystemExit(0)
 
@@ -811,6 +982,8 @@ def cli_main():
                 verify_pad=float(args.verify_pad),
                 no_subs=bool(args.no_subs),
                 subs_raw=bool(args.subs_raw),
+                model_name=str(args.model),
+                ffmpeg_threads=int(args.ffmpeg_threads),
             )
 
             # If the user specified --output, rename/move the produced default output into place

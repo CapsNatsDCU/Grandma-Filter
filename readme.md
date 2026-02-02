@@ -193,6 +193,12 @@ Flags:
 - `--no-subs` to disable subtitle muxing
 - `--subs-raw` to include the full word in subtitles (default masks like `f---`)
 
+### Performance tuning
+
+Flags:
+- `--model` (tiny/base/small/medium/large). Default: `base`
+- `--ffmpeg-threads` (0 = auto)
+
 
 You can still activate the venv manually if you prefer:
 
