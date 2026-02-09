@@ -166,6 +166,7 @@ def extract_target_word_times(
     *,
     low_confidence_threshold: float = 0.6,
     verifier=None,
+    progress_cb=None,
 ) -> List[TargetWordTime]:
     """
     Return word-level hits.
@@ -177,7 +178,8 @@ def extract_target_word_times(
     exact, prefixes = _parse_target_patterns(target_words)
     hits: List[TargetWordTime] = []
 
-    for seg in segments:
+    total = len(segments) if segments else 0
+    for seg_idx, seg in enumerate(segments):
         seg_duration = max(0.001, seg.end - seg.start)
 
         # -------------------------------------------------
@@ -210,6 +212,11 @@ def extract_target_word_times(
                                 probability=float(w.probability),
                             )
                         )
+            if progress_cb and total > 0:
+                try:
+                    progress_cb((seg_idx + 1) / total)
+                except Exception:
+                    pass
             continue
 
         # -------------------------------------------------
@@ -218,16 +225,21 @@ def extract_target_word_times(
         text_norm = remove_non_alpha((seg.text or "").lower())
         tokens = text_norm.split()
         if not tokens:
+            if progress_cb and total > 0:
+                try:
+                    progress_cb((seg_idx + 1) / total)
+                except Exception:
+                    pass
             continue
 
         seconds_per_word = seg_duration / len(tokens)
 
-        for i, tok in enumerate(tokens):
+        for tok_idx, tok in enumerate(tokens):
             if _token_matches(tok, exact, prefixes):
                 if verifier is not None and low_confidence_threshold > 0.0:
                     if not verifier(tok, float(start), float(end)):
                         continue
-                start = seg.start + i * seconds_per_word
+                start = seg.start + tok_idx * seconds_per_word
                 end = start + seconds_per_word
 
                 hits.append(
@@ -239,6 +251,12 @@ def extract_target_word_times(
                         probability=0.0,
                     )
                 )
+
+        if progress_cb and total > 0:
+            try:
+                progress_cb((seg_idx + 1) / total)
+            except Exception:
+                pass
 
     return hits
 
@@ -268,7 +286,8 @@ def build_censor_ranges(segments: List[Segment],
                         merge_gap: float = 0.02,
                         *,
                         low_confidence_threshold: float = 0.6,
-                        verifier=None) -> List[Tuple[float, float]]:
+                        verifier=None,
+                        progress_cb=None) -> List[Tuple[float, float]]:
     """Return absolute (start,end) ranges in seconds for the full audio.
 
     Preferred path: use word timestamps present in the transcription JSON (segments[].words).
@@ -282,6 +301,7 @@ def build_censor_ranges(segments: List[Segment],
         mini_audio_dir=mini_audio_dir,
         low_confidence_threshold=low_confidence_threshold,
         verifier=verifier,
+        progress_cb=progress_cb,
     )
     word_hits = len(hits)
 
@@ -304,8 +324,14 @@ def build_censor_ranges(segments: List[Segment],
     word_hits = 0
     flagged = 0
 
-    for seg in segments:
+    total = len(segments) if segments else 0
+    for i, seg in enumerate(segments):
         if not seg.contains_target_word:
+            if progress_cb and total > 0:
+                try:
+                    progress_cb((i + 1) / total)
+                except Exception:
+                    pass
             continue
 
         flagged += 1
@@ -313,6 +339,11 @@ def build_censor_ranges(segments: List[Segment],
         s = max(0.0, float(seg.start) - float(pad))
         e = max(s, float(seg.end) + float(pad))
         ranges.append((s, e))
+        if progress_cb and total > 0:
+            try:
+                progress_cb((i + 1) / total)
+            except Exception:
+                pass
 
     if flagged > 0:
         print(f"⚠ Fallback censoring: 0 word-level hits found; censoring {flagged} full segment(s).")

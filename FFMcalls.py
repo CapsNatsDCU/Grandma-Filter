@@ -38,7 +38,75 @@ def _run_ffmpeg(cmd: list[str]) -> None:
         ) from e
 
 
-def extract_audio(input_media: str, output_mp3: str = "output.mp3") -> str:
+def _run_ffmpeg_with_progress(
+    cmd: list[str],
+    *,
+    progress_cb,
+    total_duration_s: float,
+    progress_ranges: Optional[list[tuple[float, float]]] = None,
+) -> None:
+    if cmd and cmd[0] == "ffmpeg":
+        cmd = [cmd[0], "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1"] + cmd[1:]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if not proc.stdout:
+        proc.wait()
+        if proc.returncode:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
+        return
+
+    ranges = progress_ranges or []
+    total_ranges = len(ranges)
+
+    def _frac_from_time(out_s: float) -> float:
+        if total_ranges > 0:
+            done = 0
+            for _, e in ranges:
+                if out_s >= float(e):
+                    done += 1
+            return min(1.0, done / total_ranges)
+        if total_duration_s > 0:
+            return min(1.0, out_s / total_duration_s)
+        return 0.0
+
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("out_time_ms="):
+            try:
+                out_s = float(line.split("=", 1)[1]) / 1_000_000.0
+                progress_cb(_frac_from_time(out_s))
+            except Exception:
+                pass
+        elif line.startswith("out_time="):
+            try:
+                ts = line.split("=", 1)[1].strip()
+                parts = ts.split(":")
+                if len(parts) == 3:
+                    h, m, s = parts
+                    out_s = float(h) * 3600.0 + float(m) * 60.0 + float(s)
+                    progress_cb(_frac_from_time(out_s))
+            except Exception:
+                pass
+        elif line.startswith("progress="):
+            if line.endswith("end"):
+                try:
+                    progress_cb(1.0)
+                except Exception:
+                    pass
+
+    out, err = proc.communicate()
+    if proc.returncode:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output=out, stderr=err)
+
+
+def extract_audio(
+    input_media: str,
+    output_mp3: str = "output.mp3",
+    *,
+    progress_cb=None,
+    total_duration_s: Optional[float] = None,
+) -> str:
     """Extract the main audio track from a media file into an MP3."""
     out_path = Path(output_mp3)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -55,7 +123,14 @@ def extract_audio(input_media: str, output_mp3: str = "output.mp3") -> str:
         "2",
         str(out_path),
     ]
-    _run_ffmpeg(cmd)
+    if progress_cb:
+        _run_ffmpeg_with_progress(
+            cmd,
+            progress_cb=progress_cb,
+            total_duration_s=float(total_duration_s or 0.0),
+        )
+    else:
+        _run_ffmpeg(cmd)
     return str(out_path)
 
 
@@ -208,6 +283,8 @@ def censor_audio(
     beep_freq: int = 1000,
     beep_volume: float = 0.25,
     pad: float = 0.0,
+    progress_cb=None,
+    total_duration_s: Optional[float] = None,
 ) -> str:
     """Create a censored audio file."""
 
@@ -220,6 +297,11 @@ def censor_audio(
 
     if not ranges:
         shutil.copyfile(input_file, str(out_path))
+        if progress_cb:
+            try:
+                progress_cb(1.0)
+            except Exception:
+                pass
         return str(out_path)
 
     if mode_l == "mute":
@@ -238,7 +320,15 @@ def censor_audio(
             "2",
             str(out_path),
         ]
-        _run_ffmpeg(cmd)
+        if progress_cb:
+            _run_ffmpeg_with_progress(
+                cmd,
+                progress_cb=progress_cb,
+                total_duration_s=float(total_duration_s or 0.0),
+                progress_ranges=ranges,
+            )
+        else:
+            _run_ffmpeg(cmd)
         return str(out_path)
 
     # mode == 'beep'
@@ -279,7 +369,15 @@ def censor_audio(
         "2",
         str(out_path),
     ]
-    _run_ffmpeg(cmd)
+    if progress_cb:
+        _run_ffmpeg_with_progress(
+            cmd,
+            progress_cb=progress_cb,
+            total_duration_s=float(total_duration_s or duration or 0.0),
+            progress_ranges=ranges,
+        )
+    else:
+        _run_ffmpeg(cmd)
     return str(out_path)
 
 
@@ -338,7 +436,11 @@ def replace_audio_track(
             cmd += ["-metadata:s:a:1", f"language={original_language_code}"]
 
     if subtitle_file:
-        cmd += ["-c:s", "copy"]
+        ext = out_path.suffix.lower()
+        if ext in {".mp4", ".m4v"}:
+            cmd += ["-c:s", "mov_text"]
+        else:
+            cmd += ["-c:s", "copy"]
 
     cmd += [str(out_path)]
 

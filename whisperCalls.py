@@ -45,7 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 @dataclass(frozen=True)
 class TranscribeConfig:
-    model_name: str = "base"
+    model_name: str = "small"
     language: Optional[str] = None
     task: str = "transcribe"  # or "translate"
     beam_size: int = 5
@@ -82,6 +82,8 @@ def transcribe_to_dict(
     audio_file: str,
     *,
     cfg: Optional[TranscribeConfig] = None,
+    progress_cb=None,
+    total_duration_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Transcribe `audio_file` and return a structured dict (see module docstring)."""
     cfg = cfg or TranscribeConfig()
@@ -176,6 +178,12 @@ def transcribe_to_dict(
         out["segments"].append(s)
         if seg_text:
             full_text_parts.append(seg_text)
+        if progress_cb and total_duration_s and total_duration_s > 0:
+            try:
+                frac = float(s.get("end", 0.0)) / float(total_duration_s)
+                progress_cb(max(0.0, min(1.0, frac)))
+            except Exception:
+                pass
 
     out["text"] = " ".join(full_text_parts).strip()
 
@@ -192,9 +200,16 @@ def transcribe_to_json_file(
     *,
     output_json_path: str = "output.json",
     cfg: Optional[TranscribeConfig] = None,
+    progress_cb=None,
+    total_duration_s: Optional[float] = None,
 ) -> str:
     """Transcribe `audio_file` and write the JSON to `output_json_path`. Returns the path."""
-    data = transcribe_to_dict(audio_file, cfg=cfg)
+    data = transcribe_to_dict(
+        audio_file,
+        cfg=cfg,
+        progress_cb=progress_cb,
+        total_duration_s=total_duration_s,
+    )
     out_path = Path(output_json_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
@@ -211,6 +226,8 @@ def run_whisper_live(
     model_name: str = "base",
     language: Optional[str] = None,
     timeout_s: int = 0,
+    progress_cb=None,
+    total_duration_s: Optional[float] = None,
 ) -> None:
     """Legacy entry point.
 
@@ -219,7 +236,13 @@ def run_whisper_live(
     """
     _ = timeout_s
     cfg = TranscribeConfig(model_name=model_name, language=language)
-    transcribe_to_json_file(audio_file, output_json_path=output_json, cfg=cfg)
+    transcribe_to_json_file(
+        audio_file,
+        output_json_path=output_json,
+        cfg=cfg,
+        progress_cb=progress_cb,
+        total_duration_s=total_duration_s,
+    )
 
 
 def load_detected_language(transcript_json_path: str) -> Optional[str]:

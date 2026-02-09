@@ -1,5 +1,7 @@
 import argparse
+import atexit
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -95,8 +97,30 @@ def _iter_media_files(directory: str, extensions: Iterable[str], skip_censored: 
     return files
 
 
+def _iter_media_files_recursive(directory: str, extensions: Iterable[str], skip_censored: bool = True) -> list[str]:
+    """Return a sorted list of media files in `directory` (recursive)."""
+    exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions}
+    files: list[str] = []
+    for dirpath, _, filenames in os.walk(directory):
+        for name in filenames:
+            base, ext = os.path.splitext(name)
+            if ext.lower() not in exts:
+                continue
+            if skip_censored and base.endswith("_censored"):
+                continue
+            files.append(os.path.join(dirpath, name))
+    files.sort()
+    return files
+
+
 # Compatibility audio extraction wrapper
-def _extract_audio(input_media: str, output_mp3: str = "output.mp3") -> None:
+def _extract_audio(
+    input_media: str,
+    output_mp3: str = "output.mp3",
+    *,
+    progress_cb=None,
+    total_duration_s: float | None = None,
+) -> None:
     """Extract audio from the input media into an MP3.
 
     Tries to call whatever extraction function exists in FFMcalls. If none exists, falls back to ffmpeg.
@@ -119,9 +143,13 @@ def _extract_audio(input_media: str, output_mp3: str = "output.mp3") -> None:
             # Try common signatures
             for args, kwargs in (
                 ((input_media, output_mp3), {}),
+                ((input_media, output_mp3), {"progress_cb": progress_cb, "total_duration_s": total_duration_s}),
                 ((input_media,), {"output_audio": output_mp3}),
+                ((input_media,), {"output_audio": output_mp3, "progress_cb": progress_cb, "total_duration_s": total_duration_s}),
                 ((input_media,), {"output_mp3": output_mp3}),
+                ((input_media,), {"output_mp3": output_mp3, "progress_cb": progress_cb, "total_duration_s": total_duration_s}),
                 ((input_media,), {"output_file": output_mp3}),
+                ((input_media,), {"output_file": output_mp3, "progress_cb": progress_cb, "total_duration_s": total_duration_s}),
                 ((input_media,), {}),
             ):
                 try:
@@ -193,6 +221,7 @@ def main(
     debug: bool = False,
     no_subs: bool = False,
     subs_raw: bool = False,
+    subs_only: bool = False,
     model_name: str = "base",
     ffmpeg_threads: int = 0,
 ) -> dict | None:
@@ -201,6 +230,8 @@ def main(
     t0 = time.time()
     last_progress_line = ""
     log = log_line
+    if not debug:
+        atexit.register(_cleanup_temp_outputs)
 
     def _load_last_timings() -> dict[str, float]:
         try:
@@ -336,7 +367,7 @@ def main(
             phase_bar = _render_bar(phase_pct, width=12)
             _print_progress(f"total {total_bar} | {stage:<8} {phase_bar}")
 
-    def _run_stage(stage: str, pct_start: float, pct_end: float, fn):
+    def _run_stage(stage: str, pct_start: float, pct_end: float, fn, *, progress_fn=None):
         expected = 0.0
         if expected_total:
             expected = float(expected_total * float(fractions.get(stage, 0.0)))
@@ -349,11 +380,18 @@ def main(
         stop_evt = threading.Event()
 
         def _ticker():
-            if expected <= 0.0:
+            if expected <= 0.0 and progress_fn is None:
                 return
             while not stop_evt.is_set():
-                elapsed = time.time() - t_start
-                frac = min(0.99, elapsed / expected) if expected > 0 else 0.0
+                if progress_fn is not None:
+                    try:
+                        frac = float(progress_fn() or 0.0)
+                    except Exception:
+                        frac = 0.0
+                    frac = max(0.0, min(0.99, frac))
+                else:
+                    elapsed = time.time() - t_start
+                    frac = min(0.99, elapsed / expected) if expected > 0 else 0.0
                 pct = pct_start + (pct_end - pct_start) * frac
                 _stage_progress(stage, pct, frac)
                 time.sleep(0.1)
@@ -396,6 +434,9 @@ def main(
     frac_ranges = fractions.get("ranges", 0.05)
     frac_censor = fractions.get("censor", 0.07)
     frac_mux = fractions.get("mux", 0.10)
+    if subs_only:
+        frac_censor = 0.0
+        frac_mux = 0.0
     total_frac = frac_extract + frac_transcribe + frac_ranges + frac_censor + frac_mux
     if total_frac <= 0:
         total_frac = 1.0
@@ -413,19 +454,48 @@ def main(
 
     if ffmpeg_threads > 0:
         os.environ["GF_FFMPEG_THREADS"] = str(ffmpeg_threads)
-    _run_stage("extract", b0, b1, lambda: _extract_audio(filepath, "output.mp3"))
+    extract_progress = {"frac": 0.0}
+
+    def _on_extract_progress(frac: float) -> None:
+        extract_progress["frac"] = max(0.0, min(1.0, float(frac)))
+
+    _run_stage(
+        "extract",
+        b0,
+        b1,
+        lambda: _extract_audio(
+            filepath,
+            "output.mp3",
+            progress_cb=_on_extract_progress,
+            total_duration_s=input_duration_s,
+        ),
+        progress_fn=lambda: extract_progress["frac"],
+    )
     timings["extract_audio_s"] = round(time.time() - t0, 3)
     _stage_progress("extract", b1, 1.0)
     checkFile("output.mp3")
+    audio_duration_s = FFMcalls.get_audio_duration_seconds("output.mp3")
 
     # Produces output.json (segments)
     t0 = time.time()
     t0 = time.time()
+    transcribe_progress = {"frac": 0.0}
+
+    def _on_transcribe_progress(frac: float) -> None:
+        transcribe_progress["frac"] = max(0.0, min(1.0, float(frac)))
+
     _run_stage(
         "transcribe",
         b1,
         b2,
-        lambda: whisperCalls.run_whisper_live("output.mp3", "output.json", model_name=model_name),
+        lambda: whisperCalls.run_whisper_live(
+            "output.mp3",
+            "output.json",
+            model_name=model_name,
+            progress_cb=_on_transcribe_progress,
+            total_duration_s=audio_duration_s,
+        ),
+        progress_fn=lambda: transcribe_progress["frac"],
     )
     timings["transcribe_s"] = round(time.time() - t0, 3)
     _stage_progress("transcribe", b2, 1.0)
@@ -503,6 +573,11 @@ def main(
 
     # 2) Compute absolute time ranges to censor (in seconds)
     t0 = time.time()
+    ranges_progress = {"frac": 0.0}
+
+    def _on_ranges_progress(frac: float) -> None:
+        ranges_progress["frac"] = max(0.0, min(1.0, float(frac)))
+
     def _build_ranges():
         return processText.build_censor_ranges(
             segments=segments,
@@ -510,8 +585,9 @@ def main(
             pad=0.02,
             low_confidence_threshold=low_conf_threshold,
             verifier=_verify_low_confidence,
+            progress_cb=_on_ranges_progress,
         )
-    raw_ranges = _run_stage("ranges", b2, b3, _build_ranges)
+    raw_ranges = _run_stage("ranges", b2, b3, _build_ranges, progress_fn=lambda: ranges_progress["frac"])
     timings["build_ranges_s"] = round(time.time() - t0, 3)
 
     ranges = _normalize_censor_ranges(raw_ranges)
@@ -555,13 +631,92 @@ def main(
             return w
         return w[0] + ("-" * (len(w) - 1))
 
-    def _write_srt(hits_abs: list[tuple[float, float, str]], srt_path: str, *, raw_words: bool) -> None:
-        hits_abs.sort(key=lambda x: x[0])
+    def _censor_text(text: str, *, raw: bool, exact: set[str], prefixes: list[str]) -> str:
+        def _repl(m: re.Match) -> str:
+            word = m.group(0)
+            norm = processText.remove_non_alpha(word.lower())
+            if not norm:
+                return word
+            for tok in norm.split():
+                if processText._token_matches(tok, exact, prefixes):
+                    return _mask_word(word, raw=raw)
+            return word
+
+        return re.sub(r"[A-Za-z']+", _repl, text or "")
+
+    def _write_srt(
+        segments: list,
+        srt_path: str,
+        *,
+        raw_words: bool,
+        total_duration_s: float,
+        exact: set[str],
+        prefixes: list[str],
+    ) -> None:
         with open(srt_path, "w", encoding="utf-8") as f:
-            for idx, (s, e, w) in enumerate(hits_abs, start=1):
-                f.write(f"{idx}\n")
-                f.write(f"{_format_srt_time(s)} --> {_format_srt_time(e)}\n")
-                f.write(f"{_mask_word(w, raw=raw_words)}\n\n")
+            if not segments:
+                return
+            idx = 1
+            for seg in segments:
+                s = float(getattr(seg, "start", 0.0))
+                e = float(getattr(seg, "end", 0.0))
+                if e < s:
+                    e = s
+
+                words = getattr(seg, "words", []) or []
+                if not words:
+                    text = _censor_text(
+                        getattr(seg, "text", "") or "",
+                        raw=raw_words,
+                        exact=exact,
+                        prefixes=prefixes,
+                    ).strip()
+                    if not text:
+                        continue
+                    f.write(f"{idx}\n")
+                    f.write(f"{_format_srt_time(s)} --> {_format_srt_time(e)}\n")
+                    f.write(f"{text}\n\n")
+                    idx += 1
+                    continue
+
+                # Sentence-level cues using word timestamps when available.
+                cur_words: list[str] = []
+                sent_start = None
+                sent_end = None
+
+                def _flush_sentence() -> None:
+                    nonlocal idx, cur_words, sent_start, sent_end
+                    if not cur_words or sent_start is None or sent_end is None:
+                        cur_words = []
+                        sent_start = None
+                        sent_end = None
+                        return
+                    text = " ".join(cur_words).strip()
+                    text = _censor_text(text, raw=raw_words, exact=exact, prefixes=prefixes).strip()
+                    if text:
+                        f.write(f"{idx}\n")
+                        f.write(f"{_format_srt_time(sent_start)} --> {_format_srt_time(sent_end)}\n")
+                        f.write(f"{text}\n\n")
+                        idx += 1
+                    cur_words = []
+                    sent_start = None
+                    sent_end = None
+
+                for w in words:
+                    w_text = (getattr(w, "word", "") or "").strip()
+                    if not w_text:
+                        continue
+                    w_start = float(getattr(w, "start", s))
+                    w_end = float(getattr(w, "end", w_start))
+                    if sent_start is None:
+                        sent_start = w_start
+                    sent_end = w_end
+                    cur_words.append(w_text)
+
+                    if re.search(r"[.!?]$", w_text):
+                        _flush_sentence()
+
+                _flush_sentence()
 
     def _log_muted_words(file: str, segments: list) -> tuple[str, int, str, list[tuple[float, float, str]]]:
         """Append muted-word hits to muted_words.csv.
@@ -624,64 +779,93 @@ def main(
 
     processText.words_removed = hit_count
 
-    # 4) Build censored audio (mute by default, beep with -b)
-    t0 = time.time()
-    def _censor_audio():
-        if not ranges:
-            log("⚠ No valid censor ranges after normalization; copying original audio")
-            shutil.copyfile("output.mp3", "output_censored.mp3")
-        else:
-            FFMcalls.censor_audio(
-                ranges=ranges,
-                input_file="output.mp3",
-                output_file="output_censored.mp3",
-                mode=censor_mode,
-                beep_freq=1000,
-                beep_volume=0.25,
-                pad=0.0
-            )
-    _run_stage("censor", b3, b4, _censor_audio)
-    timings["censor_audio_s"] = round(time.time() - t0, 3)
-    checkFile("output_censored.mp3")
+    if not subs_only:
+        # 4) Build censored audio (mute by default, beep with -b)
+        t0 = time.time()
+        censor_progress = {"frac": 0.0}
 
-    # 5) Build censored-words subtitle file (SRT) and mux back into video
+        def _on_censor_progress(frac: float) -> None:
+            censor_progress["frac"] = max(0.0, min(1.0, float(frac)))
+
+        def _censor_audio():
+            if not ranges:
+                log("⚠ No valid censor ranges after normalization; copying original audio")
+                shutil.copyfile("output.mp3", "output_censored.mp3")
+                _on_censor_progress(1.0)
+            else:
+                FFMcalls.censor_audio(
+                    ranges=ranges,
+                    input_file="output.mp3",
+                    output_file="output_censored.mp3",
+                    mode=censor_mode,
+                    beep_freq=1000,
+                    beep_volume=0.25,
+                    pad=0.0,
+                    progress_cb=_on_censor_progress,
+                    total_duration_s=duration_s,
+                )
+        _run_stage("censor", b3, b4, _censor_audio, progress_fn=lambda: censor_progress["frac"])
+        timings["censor_audio_s"] = round(time.time() - t0, 3)
+        checkFile("output_censored.mp3")
+
+    # 5) Build transcript subtitle file (SRT) and (optionally) mux back into video
     # Default output name (caller may move/rename this when using --output/--out-dir)
     base, ext = os.path.splitext(filepath)
     output_video = f"{base}_censored{ext}"
 
-    out_base = os.path.splitext(output_video)[0]
+    srt_base = base if subs_only else os.path.splitext(output_video)[0]
     srt_path = None
     if not no_subs:
-        srt_path = f"{out_base}.srt"
-        _write_srt(hits_abs, srt_path, raw_words=bool(subs_raw))
-        log(f"Wrote censored words SRT -> {srt_path}")
+        srt_path = f"{srt_base}.srt"
+        _write_srt(
+            segments,
+            srt_path,
+            raw_words=bool(subs_raw),
+            total_duration_s=duration_s,
+            exact=exact_targets,
+            prefixes=prefix_targets,
+        )
+        log(f"Wrote transcript SRT -> {srt_path}")
 
-    log(f"MUX VIDEO: {filepath}")
-    log(f"OUTPUT VIDEO: {output_video}")
-    t0 = time.time()
-    _run_stage(
-        "mux",
-        b4,
-        b5,
-        lambda: FFMcalls.replace_audio_track(
-            video_file=filepath,
-            censored_audio="output_censored.mp3",
-            original_audio="output.mp3",
-            output_video_file=output_video,
-            subtitle_file=srt_path,
-        ),
-    )
-    timings["mux_s"] = round(time.time() - t0, 3)
-    _stage_progress("mux", 1.0, 1.0)
-    if last_progress_line:
-        print("")  # move past the progress line
-    if progress_cb:
-        progress_cb("mux", 1.0)
+    if not subs_only:
+        log(f"MUX VIDEO: {filepath}")
+        log(f"OUTPUT VIDEO: {output_video}")
+        t0 = time.time()
+        expected_out_size = 0
+        try:
+            expected_out_size = os.path.getsize(filepath)
+        except OSError:
+            expected_out_size = 0
+        _run_stage(
+            "mux",
+            b4,
+            b5,
+            lambda: FFMcalls.replace_audio_track(
+                video_file=filepath,
+                censored_audio="output_censored.mp3",
+                original_audio="output.mp3",
+                output_video_file=output_video,
+                subtitle_file=srt_path,
+            ),
+            progress_fn=(
+                (lambda: (os.path.getsize(output_video) / expected_out_size) if expected_out_size > 0 else 0.0)
+                if expected_out_size > 0
+                else None
+            ),
+        )
+        timings["mux_s"] = round(time.time() - t0, 3)
+        _stage_progress("mux", 1.0, 1.0)
+        if last_progress_line:
+            print("")  # move past the progress line
+        if progress_cb:
+            progress_cb("mux", 1.0)
 
     # 6) Write per-file JSON report (app-ready interface)
     report = {
         "input_file": filepath,
-        "output_file": output_video,
+        "output_file": None if subs_only else output_video,
+        "subtitle_file": srt_path,
+        "subtitle_only": bool(subs_only),
         "engine": "faster-whisper",
         "detected_language": detected_language,
         "censor_mode": censor_mode,
@@ -702,7 +886,7 @@ def main(
     # Write report into reports/ directory (app-friendly)
     os.makedirs("reports", exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    report_base = os.path.basename(os.path.splitext(output_video)[0])
+    report_base = os.path.basename(srt_base if subs_only else os.path.splitext(output_video)[0])
     report_name = f"{report_base}.{stamp}.report.json"
     report_path = os.path.join("reports", report_name)
 
@@ -715,6 +899,8 @@ def main(
 
     elapsed_time = time.time() - start_time
     processText.report(segments, elapsed_time)
+    if not debug:
+        _cleanup_temp_outputs()
     return report
 
 
@@ -729,6 +915,12 @@ def cli_main():
         source = parser.add_mutually_exclusive_group(required=True)
         source.add_argument("filepath", nargs="?", help="Input video or audio file")
         source.add_argument("--dir", dest="directory", help="Process all supported media files in a directory (non-recursive)")
+        parser.add_argument(
+            "-r",
+            "--recursive",
+            action="store_true",
+            help="Recurse into subdirectories when using --dir",
+        )
 
         parser.add_argument(
             "--output",
@@ -800,6 +992,11 @@ def cli_main():
             help="Do not mux the censored-words subtitle track",
         )
         parser.add_argument(
+            "--subs-only",
+            action="store_true",
+            help="Only generate subtitle files (no censored audio/video output)",
+        )
+        parser.add_argument(
             "--subs-raw",
             action="store_true",
             help="Subtitle track uses the full censored word instead of masking (e.g., 'fuck' vs 'f---')",
@@ -807,8 +1004,8 @@ def cli_main():
         parser.add_argument(
             "--model",
             type=str,
-            default="base",
-            help="Whisper model size (tiny, base, small, medium, large). Default: base",
+            default="small",
+            help="Whisper model size (tiny, base, small, medium, large). Default: small",
         )
         parser.add_argument(
             "--ffmpeg-threads",
@@ -830,6 +1027,15 @@ def cli_main():
 
         if args.in_place and (args.output_file or args.out_dir):
             log("❌ --in-place cannot be combined with --output or --out-dir")
+            raise SystemExit(2)
+        if args.subs_only and args.no_subs:
+            log("❌ --subs-only cannot be combined with --no-subs")
+            raise SystemExit(2)
+        if args.subs_only and args.in_place:
+            log("❌ --subs-only cannot be combined with --in-place")
+            raise SystemExit(2)
+        if args.subs_only and args.output_file:
+            log("❌ --subs-only cannot be combined with --output")
             raise SystemExit(2)
 
         # Strict gatekeeper + auto-installer (unless --no-check)
@@ -865,7 +1071,10 @@ def cli_main():
                 log(f"❌ Not a directory: {directory}")
                 raise SystemExit(2)
 
-            files = _iter_media_files(directory, extensions, skip_censored=(not args.no_skip_censored))
+            if args.recursive:
+                files = _iter_media_files_recursive(directory, extensions, skip_censored=(not args.no_skip_censored))
+            else:
+                files = _iter_media_files(directory, extensions, skip_censored=(not args.no_skip_censored))
 
             if not files:
                 log(f"No matching media files found in: {directory}")
@@ -883,9 +1092,14 @@ def cli_main():
             dir_reports: list[dict] = []
             for idx, path in enumerate(files, start=1):
                 base, ext = os.path.splitext(path)
+                rel = os.path.relpath(path, directory)
+                rel_dir = os.path.dirname(rel)
 
                 # Output location
-                out_dir = args.out_dir or os.path.dirname(path)
+                if args.out_dir:
+                    out_dir = os.path.join(args.out_dir, rel_dir) if args.recursive else args.out_dir
+                else:
+                    out_dir = os.path.dirname(path)
                 os.makedirs(out_dir, exist_ok=True)
                 out_name = os.path.basename(base) + f"_censored{ext}"
                 out_video = os.path.join(out_dir, out_name)
@@ -893,7 +1107,10 @@ def cli_main():
                 log(f"\n[{idx}/{len(files)}] {path}")
                 line = f"Batch {_batch_bar(idx-1)}"
                 print("\r" + line[:72].ljust(72), end="", flush=True)
-                log(f"    -> output: {out_video}")
+                if args.subs_only:
+                    log(f"    -> subs: {os.path.join(out_dir, os.path.basename(base) + '.srt')}")
+                else:
+                    log(f"    -> output: {out_video}")
 
                 if args.dry_run:
                     continue
@@ -907,6 +1124,7 @@ def cli_main():
                         verify_pad=float(args.verify_pad),
                         no_subs=bool(args.no_subs),
                         subs_raw=bool(args.subs_raw),
+                        subs_only=bool(args.subs_only),
                         model_name=str(args.model),
                         ffmpeg_threads=int(args.ffmpeg_threads),
                     )
@@ -916,14 +1134,24 @@ def cli_main():
 
                     # If output directory differs from input folder, move the default output into `out_video`
                     default_out = os.path.splitext(path)[0] + "_censored" + os.path.splitext(path)[1]
-                    if out_video != default_out:
-                        if os.path.exists(default_out):
-                            os.replace(default_out, out_video)
-                        else:
-                            log(f"    ⚠ Expected output missing: {default_out}")
+                    if not args.subs_only:
+                        if out_video != default_out:
+                            if os.path.exists(default_out):
+                                os.replace(default_out, out_video)
+                            else:
+                                log(f"    ⚠ Expected output missing: {default_out}")
+                    else:
+                        if rep and rep.get("subtitle_file") and args.out_dir:
+                            src_srt = rep["subtitle_file"]
+                            dst_srt = os.path.join(out_dir, os.path.basename(src_srt))
+                            if src_srt != dst_srt and os.path.exists(src_srt):
+                                os.replace(src_srt, dst_srt)
 
                     if rep:
-                        rep["directory_output_file"] = out_video
+                        if not args.subs_only:
+                            rep["directory_output_file"] = out_video
+                        elif args.out_dir and rep.get("subtitle_file"):
+                            rep["directory_subtitle_file"] = os.path.join(out_dir, os.path.basename(rep["subtitle_file"]))
                         dir_reports.append(rep)
 
                     if args.in_place:
@@ -960,7 +1188,8 @@ def cli_main():
                 raise SystemExit(2)
 
             log(f"INPUT: {args.filepath}")
-            log(f"OUTPUT: {out_video}")
+            if not args.subs_only:
+                log(f"OUTPUT: {out_video}")
 
             # Strict gatekeeper: input must exist before we call ffmpeg
             if not os.path.exists(args.filepath):
@@ -982,12 +1211,13 @@ def cli_main():
                 verify_pad=float(args.verify_pad),
                 no_subs=bool(args.no_subs),
                 subs_raw=bool(args.subs_raw),
+                subs_only=bool(args.subs_only),
                 model_name=str(args.model),
                 ffmpeg_threads=int(args.ffmpeg_threads),
             )
 
             # If the user specified --output, rename/move the produced default output into place
-            if args.output_file:
+            if args.output_file and not args.subs_only:
                 default_out = f"{base}_censored{ext}"
                 if os.path.exists(default_out):
                     os.makedirs(os.path.dirname(args.output_file) or ".", exist_ok=True)
@@ -996,7 +1226,7 @@ def cli_main():
                 else:
                     log(f"⚠ Expected output missing: {default_out}")
 
-            if args.in_place:
+            if args.in_place and not args.subs_only:
                 if os.path.exists(out_video):
                     os.replace(out_video, args.filepath)
                     log(f"✔ Replaced in place: {args.filepath}")

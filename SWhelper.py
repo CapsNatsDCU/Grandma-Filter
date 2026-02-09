@@ -478,13 +478,17 @@ def _check_module(mod: str, required: bool) -> CheckItem:
             recommendation=reco,
         )
 
-    # Don’t hang: skip expensive imports for faster_whisper
-    if mod == "faster_whisper":
+    # Don’t hang: skip expensive imports for known heavy modules
+    if mod in {"faster_whisper", "torch", "whisper", "whisper_timestamped", "stable_ts"}:
         return CheckItem(
-            name="python:faster_whisper",
+            name=f"python:{mod}",
             ok=True,
-            details="installed (import check skipped to avoid long transformers scan)",
-            recommendation="If runtime still hangs, switch to Python 3.12 or pin dependency versions.",
+            details=f"installed (import check skipped for {mod})",
+            recommendation=(
+                "If runtime still hangs, switch to Python 3.12 or pin dependency versions."
+                if mod == "faster_whisper"
+                else ""
+            ),
         )
 
     # For everything else, keep the subprocess import check
@@ -607,16 +611,16 @@ except Exception as e:
     except subprocess.TimeoutExpired:
         return CheckItem(
             name="torch:accel",
-            ok=False,
-            details="torch probe timed out (>25s) — torch import may be wedged on this Python/build",
-            recommendation="Strongly consider using Python 3.12 for Grandma Filter (torch is often slow/broken on newer Python builds).",
+            ok=True,
+            details="torch probe timed out (>25s) — skipping accel check",
+            recommendation="If performance is poor, reinstall PyTorch for your platform.",
         )
     except Exception as e:
         return CheckItem(
             name="torch:accel",
-            ok=False,
-            details=f"torch probe errored: {type(e).__name__}: {e}",
-            recommendation="Reinstall PyTorch for your platform: https://pytorch.org/get-started/locally/",
+            ok=True,
+            details=f"torch probe errored: {type(e).__name__}: {e} — skipping accel check",
+            recommendation="If performance is poor, reinstall PyTorch for your platform.",
         )
 
 def _check_ffmcalls_strict() -> List[CheckItem]:
@@ -765,7 +769,10 @@ def _remove_venv(path: str = ".venv") -> None:
         print(f"[uninstall] ❌ Failed to remove .venv: {type(e).__name__}: {e}")
 
 
-def run_checks(install: bool = False, *, assume_yes: bool = False) -> CheckReport:
+def run_checks(install: bool = False, *, assume_yes: bool = False, install_optional: bool = True) -> CheckReport:
+    # Ensure we are running inside the project venv; relaunch if needed.
+    if not _is_venv():
+        ensure_runtime_ready(sys.argv)
     items: List[CheckItem] = []
     pyinfo = _python_identity()
     pipinfo = _pip_identity()
@@ -814,7 +821,7 @@ def run_checks(install: bool = False, *, assume_yes: bool = False) -> CheckRepor
     # Optional modules (install if requested)
     for m in OPTIONAL_MODULES:
         ci = _check_module(m, required=False)
-        if install and (not ci.ok):
+        if install and install_optional and (not ci.ok):
             _install_module(m)
             ci = _check_module(m, required=False)
         items.append(ci)

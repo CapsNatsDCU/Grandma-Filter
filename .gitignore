@@ -7,6 +7,8 @@
 /data/*
 /reports/*
 *.mp3
+*.json
+*.csv
 
 ### macOS ###
 # General
@@ -16,5 +18,4 @@
 
 # user data
 muted_words.csv
-output.json
-recursive_censor.py
+
