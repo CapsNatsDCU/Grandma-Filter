@@ -1,5 +1,6 @@
 import argparse
 import atexit
+import json
 import os
 import re
 import shutil
@@ -232,6 +233,9 @@ def main(
     log = log_line
     if not debug:
         atexit.register(_cleanup_temp_outputs)
+    success = False
+    output_video: str | None = None
+    srt_path: str | None = None
 
     def _load_last_timings() -> dict[str, float]:
         try:
@@ -836,23 +840,31 @@ def main(
             expected_out_size = os.path.getsize(filepath)
         except OSError:
             expected_out_size = 0
-        _run_stage(
-            "mux",
-            b4,
-            b5,
-            lambda: FFMcalls.replace_audio_track(
-                video_file=filepath,
-                censored_audio="output_censored.mp3",
-                original_audio="output.mp3",
-                output_video_file=output_video,
-                subtitle_file=srt_path,
-            ),
-            progress_fn=(
-                (lambda: (os.path.getsize(output_video) / expected_out_size) if expected_out_size > 0 else 0.0)
-                if expected_out_size > 0
-                else None
-            ),
-        )
+        try:
+            _run_stage(
+                "mux",
+                b4,
+                b5,
+                lambda: FFMcalls.replace_audio_track(
+                    video_file=filepath,
+                    censored_audio="output_censored.mp3",
+                    original_audio="output.mp3",
+                    output_video_file=output_video,
+                    subtitle_file=srt_path,
+                ),
+                progress_fn=(
+                    (lambda: (os.path.getsize(output_video) / expected_out_size) if expected_out_size > 0 else 0.0)
+                    if expected_out_size > 0
+                    else None
+                ),
+            )
+        except Exception:
+            try:
+                if output_video and os.path.exists(output_video) and os.path.getsize(output_video) == 0:
+                    os.remove(output_video)
+            except Exception:
+                pass
+            raise
         timings["mux_s"] = round(time.time() - t0, 3)
         _stage_progress("mux", 1.0, 1.0)
         if last_progress_line:
@@ -959,6 +971,11 @@ def cli_main():
             help="Replace original files with censored output (safe atomic replace)",
         )
         parser.add_argument(
+            "--delete-originals",
+            action="store_true",
+            help="Delete original files after successful output (directory mode only)",
+        )
+        parser.add_argument(
             "--no-check",
             action="store_true",
             help="Skip the automatic dependency check/installer (not recommended)",
@@ -1027,6 +1044,15 @@ def cli_main():
 
         if args.in_place and (args.output_file or args.out_dir):
             log("❌ --in-place cannot be combined with --output or --out-dir")
+            raise SystemExit(2)
+        if args.delete_originals and not args.directory:
+            log("❌ --delete-originals is only valid with --dir (directory mode)")
+            raise SystemExit(2)
+        if args.delete_originals and args.in_place:
+            log("❌ --delete-originals cannot be combined with --in-place")
+            raise SystemExit(2)
+        if args.delete_originals and args.subs_only:
+            log("❌ --delete-originals cannot be combined with --subs-only")
             raise SystemExit(2)
         if args.subs_only and args.no_subs:
             log("❌ --subs-only cannot be combined with --no-subs")
@@ -1159,6 +1185,15 @@ def cli_main():
                         if os.path.exists(out_video):
                             os.replace(out_video, path)
                             log(f"    ✔ Replaced in place: {path}")
+                        else:
+                            log(f"    ⚠ Expected output missing: {out_video}")
+                    elif args.delete_originals:
+                        if os.path.exists(out_video):
+                            try:
+                                os.remove(path)
+                                log(f"    ✔ Deleted original: {path}")
+                            except Exception as e:
+                                log(f"    ⚠ Failed to delete original: {path} ({type(e).__name__}: {e})")
                         else:
                             log(f"    ⚠ Expected output missing: {out_video}")
                 except Exception as e:

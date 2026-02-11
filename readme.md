@@ -185,9 +185,10 @@ You can control this behavior:
 - `--verify-models small,medium,large`
 - `--verify-pad 0.30` (seconds of padding around the word)
 
-### Subtitle track (censored words)
+### Subtitle track (full transcript with masking)
 
-By default, output videos include a **soft subtitle track** with censored words.
+By default, output videos include a **soft subtitle track** containing the full transcript.
+Target words are masked (for example, `fuck` -> `f---`) unless raw subtitles are enabled.
 
 Flags:
 - `--no-subs` to disable subtitle muxing
@@ -196,7 +197,7 @@ Flags:
 ### Performance tuning
 
 Flags:
-- `--model` (tiny/base/small/medium/large). Default: `base`
+- `--model` (tiny/base/small/medium/large). Default: `small`
 - `--ffmpeg-threads` (0 = auto)
 
 
@@ -231,6 +232,16 @@ By default:
 
 ---
 
+### Recursive Directory Mode
+
+Process supported media files in a folder and all subfolders:
+
+```bash
+python main.py --dir ./videos -r
+```
+
+---
+
 ### Directory Mode with Separate Output Folder
 
 ```bash
@@ -239,6 +250,7 @@ python main.py --dir ./videos --out-dir ./videos_censored
 
 - Originals stay untouched
 - All censored outputs go to `./videos_censored/`
+- With `-r`, subfolder structure is mirrored under `./videos_censored/`
 
 ---
 
@@ -260,6 +272,27 @@ Shows what *would* be processed without running Whisper or ffmpeg.
 
 ---
 
+### Subtitle-Only Mode (No New Video)
+
+Generate subtitle files only (no censored audio/video output):
+
+```bash
+python main.py --dir ./videos --subs-only
+```
+
+Use with recursive scan:
+
+```bash
+python main.py --dir ./videos -r --subs-only
+```
+
+Notes:
+- `--subs-only` cannot be combined with `--no-subs`
+- `--subs-only` cannot be combined with `--in-place`
+- `--subs-only` cannot be combined with `--output`
+
+---
+
 ### In-Place Replacement (Use Carefully)
 
 Single file:
@@ -273,6 +306,26 @@ python main.py --dir ./videos --in-place
 ```
 
 The original file is replaced **only after** a successful run.
+
+`--in-place` cannot be combined with `--out-dir`.
+
+---
+
+### Delete Originals After Successful Output (Directory Mode)
+
+If you are writing outputs to a separate folder and want originals removed only after success:
+
+```bash
+python main.py --dir ./videos --out-dir ./videos_censored --delete-originals
+```
+
+Works with recursion:
+
+```bash
+python main.py --dir ./videos -r --out-dir ./videos_censored --delete-originals
+```
+
+`--delete-originals` cannot be combined with `--in-place` or `--subs-only`.
 
 ---
 
@@ -311,10 +364,11 @@ The report includes:
 
 ## Notes & Tips
 
-- Batch mode is **non-recursive by design** (safer default)
+- Batch mode is non-recursive by default; add `-r` for recursive mode
 - Temporary files are cleaned between runs
 - Errors in one file **do not stop** batch processing
 - Timing is conservative to ensure audible profanity is fully muted
+- For MP4 outputs, subtitle streams are muxed as `mov_text` for container compatibility
 
 ---
 
